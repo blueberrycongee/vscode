@@ -5,23 +5,40 @@
 
 import { Disposable } from '../../../base/common/lifecycle.js';
 import { DeferredPromise } from '../../../base/common/async.js';
+import { Emitter, Event } from '../../../base/common/event.js';
 import { ILogService } from '../../log/common/log.js';
 import { IPlaywrightService } from '../common/playwrightService.js';
 import { IBrowserViewGroupRemoteService } from '../node/browserViewGroupRemoteService.js';
 import { IBrowserViewGroup } from '../common/browserViewGroup.js';
+import { VSBuffer } from '../../../base/common/buffer.js';
 
 // eslint-disable-next-line local/code-import-patterns
 import type { Browser, BrowserContext, Page } from 'playwright-core';
 
+declare module 'playwright-core' {
+	interface Page {
+		// A hidden Playwright method that returns an AI-friendly snapshot of the page.
+		_snapshotForAI(options?: { track?: string }): Promise<{ full: string; incremental?: string }>;
+	}
+}
+
 /**
  * Shared-process implementation of {@link IPlaywrightService}.
+ *
+ * Tracks which browser views are added and lazily initialises the Playwright
+ * browser connection only when an operation that requires it is called.
  */
 export class PlaywrightService extends Disposable implements IPlaywrightService {
 	declare readonly _serviceBrand: undefined;
 
+	private readonly _trackedPages = new Set<string>();
+
+	private readonly _onDidChangeTrackedPages = this._register(new Emitter<readonly string[]>());
+	readonly onDidChangeTrackedPages: Event<readonly string[]> = this._onDidChangeTrackedPages.event;
+
 	private _browser: Browser | undefined;
 	private _pages: PlaywrightPageManager | undefined;
-	private _initPromise: Promise<void> | undefined;
+	private _initPromise: Promise<PlaywrightPageManager> | undefined;
 
 	constructor(
 		@IBrowserViewGroupRemoteService private readonly browserViewGroupRemoteService: IBrowserViewGroupRemoteService,
@@ -30,12 +47,50 @@ export class PlaywrightService extends Disposable implements IPlaywrightService 
 		super();
 	}
 
+	// --- Page tracking (no Playwright required) ---
+
+	async addPage(viewId: string): Promise<void> {
+		if (this._trackedPages.has(viewId)) {
+			return;
+		}
+
+		this._trackedPages.add(viewId);
+		this._fireTrackedPagesChanged();
+
+		if (this._pages) {
+			await this._pages.addPage(viewId);
+		}
+	}
+
+	async removePage(viewId: string): Promise<void> {
+		if (!this._trackedPages.has(viewId)) {
+			return;
+		}
+
+		this._trackedPages.delete(viewId);
+		this._fireTrackedPagesChanged();
+
+		if (this._pages) {
+			await this._pages.removePage(viewId);
+		}
+	}
+
+	async isPageAdded(viewId: string): Promise<boolean> {
+		return this._trackedPages.has(viewId);
+	}
+
+	private _fireTrackedPagesChanged(): void {
+		this._onDidChangeTrackedPages.fire([...this._trackedPages]);
+	}
+
+	// --- Playwright operations (lazy init) ---
+
 	/**
 	 * Ensure the Playwright browser connection and page map are initialized.
 	 */
-	async initialize(): Promise<void> {
+	async initialize(): Promise<PlaywrightPageManager> {
 		if (this._pages) {
-			return;
+			return this._pages;
 		}
 
 		if (this._initPromise) {
@@ -74,8 +129,17 @@ export class PlaywrightService extends Disposable implements IPlaywrightService 
 					}
 				});
 
+				// Eagerly connect any pages that were tracked before initialization.
+				await Promise.all(
+					[...this._trackedPages].map(viewId =>
+						pageManager.addPage(viewId)
+					)
+				);
+
 				this._browser = browser;
 				this._pages = pageManager;
+
+				return pageManager;
 			} catch (e) {
 				this._initPromise = undefined;
 				throw e;
@@ -83,6 +147,60 @@ export class PlaywrightService extends Disposable implements IPlaywrightService 
 		})();
 
 		return this._initPromise;
+	}
+
+	async openPage(url: string): Promise<string> {
+		const pageMap = await this.initialize();
+		const { page, viewId } = await pageMap.newPage();
+		await page.goto(url, { waitUntil: 'domcontentloaded' });
+
+		this._trackedPages.add(viewId);
+		this._fireTrackedPagesChanged();
+
+		return viewId;
+	}
+
+	async getSnapshot(pageId: string, diff = false): Promise<string> {
+		const pageMap = await this.initialize();
+		const page = await pageMap.getPage(pageId);
+		return this.snapshotPage(page, diff);
+	}
+
+	async invokeFunction<TArgs extends unknown[], TReturn>(pageId: string, fnDef: string, ...args: TArgs): Promise<{ result: TReturn; snapshot: string }> {
+		this.logService.info(`[PlaywrightService] Invoking function on view ${pageId}`);
+
+		try {
+			const pageMap = await this.initialize();
+			const page = await pageMap.getPage(pageId);
+
+			const fn = new Function('page', 'args', `return (${fnDef})(page, ...args)`) as (page: Page, args: TArgs) => Promise<TReturn>;
+			const result = await fn(page, args);
+
+			const snapshot = await this.snapshotPage(page, true);
+			return { result, snapshot };
+		} catch (err: unknown) {
+			const errorMessage = err instanceof Error ? err.message : String(err);
+			this.logService.error('[PlaywrightService] Script execution failed:', errorMessage);
+			throw err;
+		}
+	}
+
+	async captureScreenshot(pageId: string, selector?: string, fullPage?: boolean): Promise<VSBuffer> {
+		const pageMap = await this.initialize();
+		const page = await pageMap.getPage(pageId);
+		if (selector) {
+			const element = page.locator(selector);
+			const screenshotBuffer = await element.screenshot({ type: 'jpeg', quality: 80 });
+			return VSBuffer.wrap(screenshotBuffer);
+		}
+		const screenshotBuffer = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: fullPage ?? false });
+		return VSBuffer.wrap(screenshotBuffer);
+	}
+
+	private async snapshotPage(page: Page, diff = false): Promise<string> {
+		// Note: track ID is arbitrary.
+		const result = await page._snapshotForAI(diff ? { track: 'track' } : {});
+		return result.incremental ?? result.full;
 	}
 
 	override dispose(): void {

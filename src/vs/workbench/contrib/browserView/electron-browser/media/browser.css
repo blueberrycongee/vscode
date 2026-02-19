@@ -30,18 +30,70 @@
 		}
 	}
 
+	.browser-url-container {
+		flex: 1;
+		display: flex;
+		align-items: center;
+		background-color: var(--vscode-input-background);
+		border: 1px solid var(--vscode-input-border);
+		border-radius: var(--vscode-cornerRadius-small);
+
+		&:focus-within {
+			border-color: var(--vscode-focusBorder);
+		}
+	}
+
 	.browser-url-input {
 		flex: 1;
 		padding: 4px 8px;
-		background-color: var(--vscode-input-background);
+		background-color: transparent;
 		color: var(--vscode-input-foreground);
-		border: 1px solid var(--vscode-input-border);
+		border: none;
 		border-radius: var(--vscode-cornerRadius-small);
-		outline: none;
+		outline: none !important;
 		font-size: 13px;
+	}
 
-		&:focus {
-			border-color: var(--vscode-focusBorder);
+	.browser-share-toggle-container {
+		display: flex;
+		align-items: center;
+		margin: 2px 4px;
+		flex-shrink: 0;
+
+		.browser-share-toggle {
+			padding: 2px 4px;
+			border-radius: var(--vscode-cornerRadius-small);
+			border-width: 0;
+			color: var(--vscode-descriptionForeground);
+			white-space: nowrap;
+			outline: none !important;
+			gap: 4px;
+
+			.codicon {
+				margin: 0;
+			}
+
+			&:hover {
+				background-color: var(--vscode-toolbar-hoverBackground) !important;
+				color: var(--vscode-foreground);
+			}
+
+			&.checked {
+				background: linear-gradient(135deg in lab,
+					color-mix(in srgb, #51a2ff 25%, transparent),
+					color-mix(in srgb, #4af0c0 25%, transparent),
+					color-mix(in srgb, #b44aff 25%, transparent)
+				) !important;
+				color: var(--vscode-foreground);
+
+				&:hover {
+					background: linear-gradient(135deg in lab,
+						color-mix(in srgb, #51a2ff 35%, transparent),
+						color-mix(in srgb, #4af0c0 35%, transparent),
+						color-mix(in srgb, #b44aff 35%, transparent)
+					) !important;
+				}
+			}
 		}
 	}
 
@@ -49,9 +101,30 @@
 		flex: 1;
 		min-height: 0;
 		margin: 0 2px 2px;
-		overflow: hidden;
+		overflow: visible;
 		position: relative;
 		outline: none !important;
+		border-radius: 2px;
+
+		&.shared {
+			position: relative;
+
+			&::before {
+				content: '';
+				position: absolute;
+				top: -2px;
+				left: -2px;
+				right: -2px;
+				bottom: -2px;
+				background: linear-gradient(135deg in lab,
+					color-mix(in srgb, #51a2ff 100%, transparent),
+					color-mix(in srgb, #4af0c0 100%, transparent),
+					color-mix(in srgb, #b44aff 100%, transparent)
+				) !important;
+				padding: 1px;
+				pointer-events: none;
+			}
+		}
 	}
 
 	.browser-placeholder-screenshot {

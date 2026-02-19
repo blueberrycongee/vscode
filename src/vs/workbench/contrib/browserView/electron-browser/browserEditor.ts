@@ -6,6 +6,7 @@
 import './media/browser.css';
 import { localize } from '../../../../nls.js';
 import { $, addDisposableListener, Dimension, EventType, IDomPosition, registerExternalFocusChecker } from '../../../../base/browser/dom.js';
+import { Button } from '../../../../base/browser/ui/button/button.js';
 import { renderIcon } from '../../../../base/browser/ui/iconLabel/iconLabels.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { RawContextKey, IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
@@ -46,6 +47,7 @@ import { IChatRequestVariableEntry } from '../../chat/common/attachments/chatVar
 import { IElementAncestor, IElementData, IBrowserTargetLocator, getDisplayNameFromOuterHTML } from '../../../../platform/browserElements/common/browserElements.js';
 import { logBrowserOpen } from './browserViewTelemetry.js';
 import { URI } from '../../../../base/common/uri.js';
+import { IPlaywrightService } from '../../../../platform/browserView/common/playwrightService.js';
 
 export const CONTEXT_BROWSER_CAN_GO_BACK = new RawContextKey<boolean>('browserCanGoBack', false, localize('browser.canGoBack', "Whether the browser can go back"));
 export const CONTEXT_BROWSER_CAN_GO_FORWARD = new RawContextKey<boolean>('browserCanGoForward', false, localize('browser.canGoForward', "Whether the browser can go forward"));
@@ -55,6 +57,7 @@ export const CONTEXT_BROWSER_HAS_URL = new RawContextKey<boolean>('browserHasUrl
 export const CONTEXT_BROWSER_HAS_ERROR = new RawContextKey<boolean>('browserHasError', false, localize('browser.hasError', "Whether the browser has a load error"));
 export const CONTEXT_BROWSER_DEVTOOLS_OPEN = new RawContextKey<boolean>('browserDevToolsOpen', false, localize('browser.devToolsOpen', "Whether developer tools are open for the current browser view"));
 export const CONTEXT_BROWSER_ELEMENT_SELECTION_ACTIVE = new RawContextKey<boolean>('browserElementSelectionActive', false, localize('browser.elementSelectionActive', "Whether element selection is currently active"));
+export const CONTEXT_BROWSER_SHARED_WITH_CHAT = new RawContextKey<boolean>('browserSharedWithChat', false, localize('browser.sharedWithChat', "Whether the browser page is shared with chat tools"));
 
 // Re-export find widget context keys for use in actions
 export { CONTEXT_BROWSER_FIND_WIDGET_FOCUSED, CONTEXT_BROWSER_FIND_WIDGET_VISIBLE };
@@ -67,6 +70,7 @@ const originalHtmlElementFocus = HTMLElement.prototype.focus;
 
 class BrowserNavigationBar extends Disposable {
 	private readonly _urlInput: HTMLInputElement;
+	private readonly _shareButton: Button;
 
 	constructor(
 		editor: BrowserEditor,
@@ -104,10 +108,36 @@ class BrowserNavigationBar extends Disposable {
 			}
 		));
 
+		// URL input container (wraps input + share toggle)
+		const urlContainer = $('.browser-url-container');
+
 		// URL input
 		this._urlInput = $<HTMLInputElement>('input.browser-url-input');
 		this._urlInput.type = 'text';
 		this._urlInput.placeholder = localize('browser.urlPlaceholder', "Enter a URL");
+
+		// Share toggle button (inside URL bar, right side)
+		const shareButtonContainer = $('.browser-share-toggle-container');
+		this._shareButton = this._register(new Button(shareButtonContainer, {
+			supportIcons: true,
+			title: localize('browser.shareWithAgent', "Share with Agent"),
+			small: true,
+			buttonBackground: 'transparent',
+			buttonHoverBackground: 'transparent',
+			buttonForeground: 'inherit',
+			buttonBorder: undefined,
+			buttonSeparator: undefined,
+			buttonSecondaryBackground: undefined,
+			buttonSecondaryForeground: undefined,
+			buttonSecondaryHoverBackground: undefined,
+			buttonSecondaryBorder: undefined,
+			hoverDelegate
+		}));
+		this._shareButton.element.classList.add('browser-share-toggle');
+		this._shareButton.label = '$(agent)';
+
+		urlContainer.appendChild(this._urlInput);
+		urlContainer.appendChild(shareButtonContainer);
 
 		// Create actions toolbar (right side) with scoped context
 		const actionsContainer = $('.browser-actions-toolbar');
@@ -126,9 +156,9 @@ class BrowserNavigationBar extends Disposable {
 		navToolbar.context = editor;
 		actionsToolbar.context = editor;
 
-		// Assemble layout: nav | url | actions
+		// Assemble layout: nav | url container | actions
 		container.appendChild(navContainer);
-		container.appendChild(this._urlInput);
+		container.appendChild(urlContainer);
 		container.appendChild(actionsContainer);
 
 		// Setup URL input handler
@@ -145,6 +175,24 @@ class BrowserNavigationBar extends Disposable {
 		this._register(addDisposableListener(this._urlInput, EventType.FOCUS, () => {
 			this._urlInput.select();
 		}));
+
+		// Share toggle click handler
+		this._register(this._shareButton.onDidClick(() => {
+			editor.toggleShareWithChat();
+		}));
+	}
+
+	/**
+	 * Update the share toggle visual state
+	 */
+	setShared(isShared: boolean): void {
+		this._shareButton.checked = isShared;
+		this._shareButton.label = isShared
+			? localize('browser.sharingWithAgent', "Sharing with Agent") + ' $(agent)'
+			: '$(agent)';
+		this._shareButton.setTitle(isShared
+			? localize('browser.unshareWithAgent', "Stop Sharing with Agent")
+			: localize('browser.shareWithAgent', "Share with Agent"));
 	}
 
 	/**
@@ -192,6 +240,7 @@ export class BrowserEditor extends EditorPane {
 	private _hasErrorContext!: IContextKey<boolean>;
 	private _devToolsOpenContext!: IContextKey<boolean>;
 	private _elementSelectionActiveContext!: IContextKey<boolean>;
+	private _sharedWithChatContext!: IContextKey<boolean>;
 
 	private _model: IBrowserViewModel | undefined;
 	private readonly _inputDisposables = this._register(new DisposableStore());
@@ -212,7 +261,8 @@ export class BrowserEditor extends EditorPane {
 		@IEditorService private readonly editorService: IEditorService,
 		@IBrowserElementsService private readonly browserElementsService: IBrowserElementsService,
 		@IChatWidgetService private readonly chatWidgetService: IChatWidgetService,
-		@IConfigurationService private readonly configurationService: IConfigurationService
+		@IConfigurationService private readonly configurationService: IConfigurationService,
+		@IPlaywrightService private readonly playwrightService: IPlaywrightService
 	) {
 		super(BrowserEditor.ID, group, telemetryService, themeService, storageService);
 	}
@@ -232,6 +282,7 @@ export class BrowserEditor extends EditorPane {
 		this._hasErrorContext = CONTEXT_BROWSER_HAS_ERROR.bindTo(contextKeyService);
 		this._devToolsOpenContext = CONTEXT_BROWSER_DEVTOOLS_OPEN.bindTo(contextKeyService);
 		this._elementSelectionActiveContext = CONTEXT_BROWSER_ELEMENT_SELECTION_ACTIVE.bindTo(contextKeyService);
+		this._sharedWithChatContext = CONTEXT_BROWSER_SHARED_WITH_CHAT.bindTo(contextKeyService);
 
 		// Currently this is always true since it is scoped to the editor container
 		CONTEXT_BROWSER_FOCUSED.bindTo(contextKeyService);
@@ -332,6 +383,7 @@ export class BrowserEditor extends EditorPane {
 
 		this._storageScopeContext.set(this._model.storageScope);
 		this._devToolsOpenContext.set(this._model.isDevToolsOpen);
+		this._updateSharingState(input.id);
 
 		// Update find widget with new model
 		this._findWidget.rawValue?.setModel(this._model);
@@ -339,6 +391,11 @@ export class BrowserEditor extends EditorPane {
 		// Clean up on input disposal
 		this._inputDisposables.add(input.onWillDispose(() => {
 			this._model = undefined;
+		}));
+
+		// Listen for sharing state changes affecting this page
+		this._inputDisposables.add(this.playwrightService.onDidChangeTrackedPages(() => {
+			this._updateSharingState(input.id);
 		}));
 
 		// Initialize UI state and context keys from model
@@ -576,6 +633,28 @@ export class BrowserEditor extends EditorPane {
 
 	getUrl(): string | undefined {
 		return this._model?.url;
+	}
+
+	private _updateSharingState(viewId: string): void {
+		this.playwrightService.isPageAdded(viewId).then(isShared => {
+			this._sharedWithChatContext.set(isShared);
+			this._browserContainer.classList.toggle('shared', isShared);
+			this._navigationBar.setShared(isShared);
+		});
+	}
+
+	toggleShareWithChat(): void {
+		const input = this.input;
+		if (!(input instanceof BrowserEditorInput)) {
+			return;
+		}
+		this.playwrightService.isPageAdded(input.id).then(isAdded => {
+			if (isAdded) {
+				this.playwrightService.removePage(input.id);
+			} else {
+				this.playwrightService.addPage(input.id);
+			}
+		});
 	}
 
 	async navigateToUrl(url: string): Promise<void> {
