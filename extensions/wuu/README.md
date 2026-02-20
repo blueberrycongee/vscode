@@ -1,12 +1,12 @@
 # Wuu (built-in)
 
-Wuu adds a task panel for worktree-first development inside VS Code.
+Wuu adds a panel workspace for worktree-first development inside VS Code.
 
 ## Current MVP
 
 - Create isolated git worktrees per task
-- List tasks in a dedicated **Wuu** activity bar view
-- Track exported patches in a dedicated **Patch Inbox** view
+- List tasks in the bottom **Wuu** panel view
+- Track exported patches in a dedicated **Patch Inbox** panel view
 - Open a central **Wuu Dashboard** editor tab for task/session orchestration
 - Attach multiple agent sessions to each task
 - Show branch and changed-file count per task

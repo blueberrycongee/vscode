@@ -46,7 +46,7 @@
   },
   "contributes": {
     "viewsContainers": {
-      "activitybar": [
+      "panel": [
         {
           "id": "wuu",
           "title": "%viewContainer.wuu.title%",

@@ -659,21 +659,6 @@ export function activate(context: ExtensionContext): void {
 		}),
 	);
 
-	const openDashboardWhenWuuVisible = () => {
-		if (taskTreeView.visible || patchTreeView.visible) {
-			dashboardPanel.open();
-		}
-	};
-
-	context.subscriptions.push(
-		taskTreeView.onDidChangeVisibility(() => {
-			openDashboardWhenWuuVisible();
-		}),
-		patchTreeView.onDidChangeVisibility(() => {
-			openDashboardWhenWuuVisible();
-		}),
-	);
-
 	void initializeView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 }
 
