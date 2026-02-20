@@ -7,6 +7,7 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 import {
 	commands,
+	Disposable,
 	EventEmitter,
 	ExtensionContext,
 	extensions,
@@ -16,9 +17,12 @@ import {
 	TreeItem,
 	TreeItemCollapsibleState,
 	Uri,
+	WebviewView,
+	WebviewViewProvider,
 	window,
 	workspace,
 	type Event,
+	type Webview,
 	WorkspaceFolder,
 } from 'vscode';
 import { countChangedFiles, pathExists, resolveRepositoryRoot, runGit } from './git';
@@ -66,6 +70,20 @@ interface WuuSessionState {
 	running: boolean;
 	pty?: WuuPtyInfo;
 }
+
+interface WuuSessionHubEntry {
+	id: string;
+	name: string;
+	agent: string;
+	taskTitle: string;
+	statusLabel: string;
+	running: boolean;
+	createdAt: string;
+}
+
+type SessionViewMessage =
+	| { type: 'openSession'; sessionId: string }
+	| { type: 'sendQuickReply'; sessionId: string; text: string };
 
 interface WuuPatchState {
 	patch: WuuPatchRecord;
@@ -125,8 +143,8 @@ class WuuSessionItem extends TreeItem {
 		this.description = toSessionDescription(state);
 		this.tooltip = toSessionTooltip(state);
 		this.command = {
-			command: 'wuu.openSessionTerminal',
-			title: l10n.t('Open Session Terminal'),
+			command: 'wuu.openSessionTerminalEditor',
+			title: l10n.t('Open Session Terminal in Editor'),
 			arguments: [this],
 		};
 
@@ -287,6 +305,78 @@ class WuuPatchInboxProvider implements TreeDataProvider<WuuPatchTreeItem> {
 	}
 }
 
+class WuuSessionsViewProvider implements WebviewViewProvider, Disposable {
+	private view: WebviewView | undefined;
+	private sessions: WuuSessionHubEntry[] = [];
+
+	constructor(
+		private readonly openSession: (sessionId: string) => Promise<void>,
+		private readonly sendQuickReply: (sessionId: string, text: string) => Promise<void>,
+	) { }
+
+	dispose(): void {
+		this.view = undefined;
+	}
+
+	setData(sessionStates: WuuSessionState[]): void {
+		this.sessions = sessionStates
+			.slice()
+			.sort((a, b) => b.session.createdAt.localeCompare(a.session.createdAt))
+			.map(sessionState => ({
+				id: sessionState.session.id,
+				name: sessionState.session.name,
+				agent: sessionState.session.agent,
+				taskTitle: sessionState.task?.title ?? l10n.t('Missing task'),
+				statusLabel: statusLabel(sessionState.status),
+				running: sessionState.running,
+				createdAt: sessionState.session.createdAt,
+			}));
+		void this.publish();
+	}
+
+	resolveWebviewView(webviewView: WebviewView): void {
+		this.view = webviewView;
+		webviewView.webview.options = {
+			enableScripts: true,
+		};
+		webviewView.description = l10n.t('Quick Reply + Open Terminal');
+		webviewView.badge = this.sessions.length > 0 ? { value: this.sessions.length, tooltip: l10n.t('Active Wuu sessions') } : undefined;
+		webviewView.webview.html = renderSessionsWebviewHtml(webviewView.webview);
+
+		webviewView.webview.onDidReceiveMessage(async (message: SessionViewMessage) => {
+			try {
+				if (message.type === 'openSession') {
+					await this.openSession(message.sessionId);
+				} else if (message.type === 'sendQuickReply') {
+					await this.sendQuickReply(message.sessionId, message.text);
+				}
+			} finally {
+				await this.publish();
+			}
+		});
+
+		webviewView.onDidDispose(() => {
+			if (this.view === webviewView) {
+				this.view = undefined;
+			}
+		});
+
+		void this.publish();
+	}
+
+	private async publish(): Promise<void> {
+		if (!this.view) {
+			return;
+		}
+
+		this.view.badge = this.sessions.length > 0 ? { value: this.sessions.length, tooltip: l10n.t('Active Wuu sessions') } : undefined;
+		await this.view.webview.postMessage({
+			type: 'sessions',
+			sessions: this.sessions,
+		});
+	}
+}
+
 class WuuStore {
 	constructor(private readonly context: ExtensionContext) { }
 
@@ -346,17 +436,27 @@ export function activate(context: ExtensionContext): void {
 	const ptyManager = new WuuPtyManager();
 	const patchStore = new WuuPatchStore();
 	const statusStore = new WuuSessionStatusStore(store.getSessionStatuses());
+	const sessionsProvider = new WuuSessionsViewProvider(
+		async sessionId => {
+			await openSessionTerminalById(sessionId, store, statusStore, ptyManager, true);
+		},
+		async (sessionId, text) => {
+			await quickReplySessionById(sessionId, text, store, statusStore, ptyManager);
+		},
+	);
 
 	context.subscriptions.push(
 		ptyManager,
+		sessionsProvider,
 		window.createTreeView('wuu.tasks', { treeDataProvider: taskProvider }),
 		window.createTreeView('wuu.patches', { treeDataProvider: patchProvider }),
+		window.registerWebviewViewProvider('wuu.sessions', sessionsProvider),
 		commands.registerCommand('wuu.createTask', async () => {
 			await createTask(store);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.refreshTasks', async () => {
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openTask', async (item?: WuuTaskItem) => {
 			const selected = item?.state.task ?? await pickTask(store);
@@ -373,7 +473,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await removeTask(selected, store, patchStore, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.createSession', async (item?: WuuTaskItem) => {
 			const selectedTask = item?.state.task ?? await pickTask(store);
@@ -382,7 +482,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await createSession(selectedTask, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.startSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -391,7 +491,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await startSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.stopSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -400,7 +500,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await stopSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openSessionTerminal', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -408,8 +508,22 @@ export function activate(context: ExtensionContext): void {
 				return;
 			}
 
-			await openSessionTerminal(selectedSession, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await openSessionTerminal(selectedSession, store, statusStore, ptyManager, true);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.openSessionTerminalEditor', async (item?: WuuSessionItem | string) => {
+			const selectedSessionId = typeof item === 'string' ? item : item?.state.session.id;
+			if (selectedSessionId) {
+				await openSessionTerminalById(selectedSessionId, store, statusStore, ptyManager, true);
+			} else {
+				const selectedSession = await pickSession(store);
+				if (!selectedSession) {
+					return;
+				}
+				await openSessionTerminal(selectedSession, store, statusStore, ptyManager, true);
+			}
+
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.removeSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -418,7 +532,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await removeSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.exportTaskPatch', async (item?: WuuTaskItem) => {
 			const task = item?.state.task ?? await pickTask(store);
@@ -427,7 +541,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await exportTaskPatch(task, patchStore);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.previewPatch', async (item?: WuuTaskItem | WuuPatchItem) => {
 			const patch = await resolvePatchSelection(item, store, patchStore, undefined);
@@ -444,7 +558,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await applyPatchToWorkspace(patch, patchStore);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.requeuePatch', async (item?: WuuPatchItem) => {
 			const patch = item?.state.patch ?? await pickPatch(store, patchStore, { statuses: ['conflict', 'applied'] });
@@ -453,7 +567,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await requeuePatch(patch, patchStore);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.markPatchApplied', async (item?: WuuPatchItem) => {
 			const patch = item?.state.patch ?? await pickPatch(store, patchStore, { statuses: ['conflict', 'pending'] });
@@ -462,7 +576,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await markPatchApplied(patch, patchStore);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.removePatch', async (item?: WuuPatchItem) => {
 			const patch = item?.state.patch ?? await pickPatch(store, patchStore);
@@ -471,18 +585,40 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await removePatchRecord(patch, patchStore);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.focusPatchInbox', async () => {
 			await commands.executeCommand('wuu.patches.focus');
 		}),
+		commands.registerCommand('wuu.focusSessions', async () => {
+			await commands.executeCommand('wuu.sessions.focus');
+		}),
+		commands.registerCommand('wuu.quickReplySession', async (item?: WuuSessionItem | string) => {
+			const selectedSessionId = typeof item === 'string' ? item : item?.state.session.id;
+			const selectedSession = selectedSessionId ? store.getSessions().find(session => session.id === selectedSessionId) : await pickSession(store);
+			if (!selectedSession) {
+				return;
+			}
+
+			const text = await window.showInputBox({
+				title: l10n.t('Quick Reply'),
+				prompt: l10n.t('Send to session "{0}"', selectedSession.name),
+				ignoreFocusOut: true,
+			});
+			if (!text || text.trim().length === 0) {
+				return;
+			}
+
+			await quickReplySession(selectedSession, text, store, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+		}),
 		ptyManager.onDidExit(async event => {
 			await setSessionStatus(event.sessionId, { type: 'idle' }, statusStore, store);
-			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 		}),
 	);
 
-	void initializeView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+	void initializeView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 }
 
 export function deactivate(): void {
@@ -491,6 +627,7 @@ export function deactivate(): void {
 async function initializeView(
 	taskProvider: WuuTreeProvider,
 	patchProvider: WuuPatchInboxProvider,
+	sessionsProvider: WuuSessionsViewProvider,
 	store: WuuStore,
 	patchStore: WuuPatchStore,
 	statusStore: WuuSessionStatusStore,
@@ -502,7 +639,7 @@ async function initializeView(
 		}
 	}
 	await store.saveSessionStatuses(statusStore.list());
-	await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+	await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
 }
 
 async function createTask(store: WuuStore): Promise<void> {
@@ -701,20 +838,70 @@ async function openSessionTerminal(
 	store: WuuStore,
 	statusStore: WuuSessionStatusStore,
 	ptyManager: WuuPtyManager,
+	openInEditorSide: boolean,
 ): Promise<void> {
-	if (ptyManager.reveal(session.id)) {
+	if (openInEditorSide ? await ptyManager.revealInEditorSide(session.id) : ptyManager.reveal(session.id)) {
 		return;
 	}
 
-	const startAction = l10n.t('Start Session');
-	const selection = await window.showInformationMessage(
-		l10n.t('Session "{0}" is not running.', session.name),
-		startAction,
-	);
+	await startSession(session, store, statusStore, ptyManager);
+	if (openInEditorSide) {
+		await ptyManager.revealInEditorSide(session.id);
+	}
+}
 
-	if (selection === startAction) {
+async function openSessionTerminalById(
+	sessionId: string,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+	openInEditorSide: boolean,
+): Promise<void> {
+	const session = store.getSessions().find(item => item.id === sessionId);
+	if (!session) {
+		window.showErrorMessage(l10n.t('Session no longer exists.'));
+		return;
+	}
+
+	await openSessionTerminal(session, store, statusStore, ptyManager, openInEditorSide);
+}
+
+async function quickReplySession(
+	session: WuuSessionRecord,
+	text: string,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
+	const normalized = text.trim();
+	if (!normalized) {
+		return;
+	}
+
+	if (!ptyManager.isRunning(session.id)) {
 		await startSession(session, store, statusStore, ptyManager);
 	}
+
+	if (!ptyManager.sendText(session.id, normalized, true)) {
+		window.showErrorMessage(l10n.t('Session "{0}" is not running.', session.name));
+		return;
+	}
+}
+
+async function quickReplySessionById(
+	sessionId: string,
+	text: string,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
+	const session = store.getSessions().find(item => item.id === sessionId);
+	if (!session) {
+		window.showErrorMessage(l10n.t('Session no longer exists.'));
+		return;
+	}
+
+	await quickReplySession(session, text, store, statusStore, ptyManager);
 }
 
 async function removeSession(
@@ -1095,6 +1282,7 @@ async function listPatchesForKnownTasks(store: WuuStore, patchStore: WuuPatchSto
 async function refreshView(
 	taskProvider: WuuTreeProvider,
 	patchProvider: WuuPatchInboxProvider,
+	sessionsProvider: WuuSessionsViewProvider,
 	store: WuuStore,
 	patchStore: WuuPatchStore,
 	statusStore: WuuSessionStatusStore,
@@ -1123,6 +1311,7 @@ async function refreshView(
 
 	taskProvider.setData(taskStates, sessionStates);
 	patchProvider.setData(patchStates);
+	sessionsProvider.setData(sessionStates);
 }
 
 async function inspectTask(task: WuuTaskRecord, patchSummary: WuuPatchSummary): Promise<WuuTaskState> {
@@ -1390,6 +1579,201 @@ async function getGitRepositoryApi(repoRoot: string): Promise<GitRepositoryApi |
 	const git = extension.isActive ? extension.exports : await extension.activate();
 	const api = git.getAPI(1);
 	return api.repositories.find(repository => repository.rootUri.fsPath === repoRoot);
+}
+
+function renderSessionsWebviewHtml(webview: Webview): string {
+	const nonce = createNonce();
+	const noSessionsText = JSON.stringify(l10n.t("No sessions yet. Create one from Wuu Tasks."));
+	const runningText = JSON.stringify(l10n.t("running"));
+	const quickReplyPlaceholder = JSON.stringify(l10n.t("Quick reply (Enter to send)"));
+	const sendLabel = JSON.stringify(l10n.t("Send"));
+	const openLabel = JSON.stringify(l10n.t("Open"));
+	const quote = String.fromCharCode(39);
+	const csp = [
+		`default-src ${quote}none${quote}`,
+		`img-src ${webview.cspSource} https:`,
+		`style-src ${webview.cspSource} ${quote}unsafe-inline${quote}`,
+		`script-src ${quote}nonce-${nonce}${quote}`,
+	].join('; ');
+
+	return `<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8" />
+	<meta http-equiv="Content-Security-Policy" content="${csp}" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<style>
+		:root {
+			color-scheme: light dark;
+		}
+		body {
+			margin: 0;
+			padding: 12px;
+			font-family: var(--vscode-font-family);
+			background: var(--vscode-sideBar-background);
+			color: var(--vscode-sideBar-foreground);
+		}
+		#sessions {
+			display: flex;
+			flex-direction: column;
+			gap: 10px;
+		}
+		.session {
+			display: grid;
+			gap: 8px;
+			padding: 10px;
+			border-radius: 12px;
+			border: 1px solid var(--vscode-sideBar-border);
+			background: color-mix(in srgb, var(--vscode-editor-background) 90%, transparent);
+			cursor: pointer;
+		}
+		.header {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			gap: 8px;
+		}
+		.title {
+			font-weight: 600;
+		}
+		.meta {
+			font-size: 12px;
+			opacity: 0.8;
+		}
+		.row {
+			display: flex;
+			gap: 6px;
+		}
+		.quick {
+			flex: 1;
+			min-width: 0;
+			border: 1px solid var(--vscode-input-border);
+			background: var(--vscode-input-background);
+			color: var(--vscode-input-foreground);
+			border-radius: 8px;
+			padding: 6px 8px;
+		}
+		.btn {
+			border: 1px solid var(--vscode-button-border, transparent);
+			background: var(--vscode-button-background);
+			color: var(--vscode-button-foreground);
+			border-radius: 8px;
+			padding: 6px 10px;
+		}
+		.empty {
+			padding: 14px;
+			border-radius: 10px;
+			border: 1px dashed var(--vscode-sideBar-border);
+			opacity: 0.8;
+		}
+	</style>
+</head>
+<body>
+	<div id="sessions"></div>
+	<script nonce="${nonce}">
+		const vscode = acquireVsCodeApi();
+		const sessionsRoot = document.getElementById('sessions');
+		let sessions = [];
+
+		function render() {
+			sessionsRoot.innerHTML = '';
+			if (!sessions.length) {
+				const empty = document.createElement('div');
+				empty.className = 'empty';
+				empty.textContent = ${noSessionsText};
+				sessionsRoot.appendChild(empty);
+				return;
+			}
+
+			for (const session of sessions) {
+				const card = document.createElement('div');
+				card.className = 'session';
+				card.dataset.sessionId = session.id;
+				card.addEventListener('click', event => {
+					const target = event.target;
+					if (target instanceof HTMLElement && (target.closest('.quick') || target.closest('.send'))) {
+						return;
+					}
+					vscode.postMessage({ type: 'openSession', sessionId: session.id });
+				});
+
+				const header = document.createElement('div');
+				header.className = 'header';
+				const title = document.createElement('div');
+				title.className = 'title';
+				title.textContent = session.name;
+				const status = document.createElement('div');
+				status.className = 'meta';
+				status.textContent = session.running ? ${runningText} : session.statusLabel;
+				header.appendChild(title);
+				header.appendChild(status);
+
+				const meta = document.createElement('div');
+				meta.className = 'meta';
+				meta.textContent = session.taskTitle + ' · ' + session.agent;
+
+				const row = document.createElement('div');
+				row.className = 'row';
+				const input = document.createElement('input');
+				input.className = 'quick';
+				input.placeholder = ${quickReplyPlaceholder};
+				input.addEventListener('keydown', event => {
+					if (event.key !== 'Enter') {
+						return;
+					}
+					event.preventDefault();
+					const text = input.value.trim();
+					if (!text) {
+						return;
+					}
+					vscode.postMessage({ type: 'sendQuickReply', sessionId: session.id, text });
+					input.value = '';
+				});
+				const send = document.createElement('button');
+				send.className = 'btn send';
+				send.type = 'button';
+				send.textContent = ${sendLabel};
+				send.addEventListener('click', () => {
+					const text = input.value.trim();
+					if (!text) {
+						return;
+					}
+					vscode.postMessage({ type: 'sendQuickReply', sessionId: session.id, text });
+					input.value = '';
+				});
+				const open = document.createElement('button');
+				open.className = 'btn';
+				open.type = 'button';
+				open.textContent = ${openLabel};
+				open.addEventListener('click', () => {
+					vscode.postMessage({ type: 'openSession', sessionId: session.id });
+				});
+				row.appendChild(input);
+				row.appendChild(send);
+				row.appendChild(open);
+
+				card.appendChild(header);
+				card.appendChild(meta);
+				card.appendChild(row);
+				sessionsRoot.appendChild(card);
+			}
+		}
+
+		window.addEventListener('message', event => {
+			const message = event.data;
+			if (!message || message.type !== 'sessions' || !Array.isArray(message.sessions)) {
+				return;
+			}
+			sessions = message.sessions;
+			render();
+		});
+	</script>
+</body>
+</html>`;
+}
+
+function createNonce(): string {
+	return Math.random().toString(36).slice(2, 12);
 }
 
 function asErrorMessage(error: unknown): string {
