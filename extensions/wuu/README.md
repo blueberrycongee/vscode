@@ -11,6 +11,8 @@ Wuu adds a task panel for worktree-first development inside VS Code.
 - Track session status (`idle`, `busy`, `retry`) inspired by OpenCode session status flow
 - Open any task worktree in a new VS Code window
 - Start and stop per-session terminals in each task worktree
+- Export patch files from task worktrees into `.wuu/patches/`
+- Preview and apply exported patches back to the primary workspace branch
 - Remove task metadata/worktree and cascade remove attached sessions
 
 ## Commands
@@ -24,6 +26,9 @@ Wuu adds a task panel for worktree-first development inside VS Code.
 - `Wuu: Stop Session`
 - `Wuu: Open Session Terminal`
 - `Wuu: Remove Session`
+- `Wuu: Export Task Patch`
+- `Wuu: Preview Patch`
+- `Wuu: Apply Patch to Workspace`
 
 ## Configuration
 

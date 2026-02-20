@@ -27,7 +27,10 @@
     "onCommand:wuu.startSession",
     "onCommand:wuu.stopSession",
     "onCommand:wuu.openSessionTerminal",
-    "onCommand:wuu.removeSession"
+    "onCommand:wuu.removeSession",
+    "onCommand:wuu.exportTaskPatch",
+    "onCommand:wuu.previewPatch",
+    "onCommand:wuu.applyPatch"
   ],
   "main": "./out/extension",
   "scripts": {
@@ -108,6 +111,21 @@
         "command": "wuu.removeSession",
         "category": "%command.category%",
         "title": "%command.removeSession%"
+      },
+      {
+        "command": "wuu.exportTaskPatch",
+        "category": "%command.category%",
+        "title": "%command.exportTaskPatch%"
+      },
+      {
+        "command": "wuu.previewPatch",
+        "category": "%command.category%",
+        "title": "%command.previewPatch%"
+      },
+      {
+        "command": "wuu.applyPatch",
+        "category": "%command.category%",
+        "title": "%command.applyPatch%"
       }
     ],
     "menus": {
@@ -126,6 +144,16 @@
           "command": "wuu.createSession",
           "when": "view == wuu.tasks",
           "group": "navigation@2"
+        },
+        {
+          "command": "wuu.previewPatch",
+          "when": "view == wuu.tasks",
+          "group": "navigation@3"
+        },
+        {
+          "command": "wuu.applyPatch",
+          "when": "view == wuu.tasks",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -143,6 +171,21 @@
           "command": "wuu.createSession",
           "when": "view == wuu.tasks && viewItem == wuuTask",
           "group": "navigation@1"
+        },
+        {
+          "command": "wuu.exportTaskPatch",
+          "when": "view == wuu.tasks && viewItem == wuuTask",
+          "group": "navigation@2"
+        },
+        {
+          "command": "wuu.previewPatch",
+          "when": "view == wuu.tasks && viewItem == wuuTask",
+          "group": "navigation@3"
+        },
+        {
+          "command": "wuu.applyPatch",
+          "when": "view == wuu.tasks && viewItem == wuuTask",
+          "group": "navigation@4"
         },
         {
           "command": "wuu.openSessionTerminal",
