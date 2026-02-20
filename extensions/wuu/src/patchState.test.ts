@@ -74,3 +74,22 @@ test('patch store removes patches for a specific task', async () => {
 	assert.strictEqual(patches.length, 1);
 	assert.strictEqual(patches[0].taskId, 'task-b');
 });
+
+test('patch store removes a single patch record and its file', async () => {
+	const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'wuu-patch-single-remove-'));
+	const store = new WuuPatchStore();
+	const patchPath = path.join(repoRoot, '.wuu', 'patches', 'task-a', 'a.patch');
+	await fs.mkdir(path.dirname(patchPath), { recursive: true });
+	await fs.writeFile(patchPath, 'diff --git\n', 'utf8');
+
+	const patch = createPatchRecord({ repoRoot, taskId: 'task-a', patchPath });
+	await store.add(repoRoot, patch);
+
+	const removed = await store.remove(repoRoot, patch.id);
+	assert.strictEqual(removed, true);
+
+	const patches = await store.list(repoRoot);
+	assert.strictEqual(patches.length, 0);
+
+	await assert.rejects(fs.access(patchPath));
+});
