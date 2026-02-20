@@ -447,6 +447,8 @@ export function activate(context: ExtensionContext): void {
 	const ptyManager = new WuuPtyManager();
 	const patchStore = new WuuPatchStore();
 	const statusStore = new WuuSessionStatusStore(store.getSessionStatuses());
+	const taskTreeView = window.createTreeView('wuu.tasks', { treeDataProvider: taskProvider });
+	const patchTreeView = window.createTreeView('wuu.patches', { treeDataProvider: patchProvider });
 	const dashboardPanel = new WuuDashboardPanel({
 		createTask: async () => {
 			await createTask(store);
@@ -488,8 +490,8 @@ export function activate(context: ExtensionContext): void {
 	context.subscriptions.push(
 		ptyManager,
 		dashboardPanel,
-		window.createTreeView('wuu.tasks', { treeDataProvider: taskProvider }),
-		window.createTreeView('wuu.patches', { treeDataProvider: patchProvider }),
+		taskTreeView,
+		patchTreeView,
 		commands.registerCommand('wuu.openDashboard', () => {
 			dashboardPanel.open();
 		}),
@@ -657,6 +659,21 @@ export function activate(context: ExtensionContext): void {
 		}),
 	);
 
+	const openDashboardWhenWuuVisible = () => {
+		if (taskTreeView.visible || patchTreeView.visible) {
+			dashboardPanel.open();
+		}
+	};
+
+	context.subscriptions.push(
+		taskTreeView.onDidChangeVisibility(() => {
+			openDashboardWhenWuuVisible();
+		}),
+		patchTreeView.onDidChangeVisibility(() => {
+			openDashboardWhenWuuVisible();
+		}),
+	);
+
 	void initializeView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 }
 
@@ -679,7 +696,6 @@ async function initializeView(
 	}
 	await store.saveSessionStatuses(statusStore.list());
 	await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
-	dashboardPanel.open();
 }
 
 async function createTask(store: WuuStore): Promise<void> {
