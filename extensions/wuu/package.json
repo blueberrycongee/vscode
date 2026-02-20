@@ -30,7 +30,11 @@
     "onCommand:wuu.removeSession",
     "onCommand:wuu.exportTaskPatch",
     "onCommand:wuu.previewPatch",
-    "onCommand:wuu.applyPatch"
+    "onCommand:wuu.applyPatch",
+    "onCommand:wuu.requeuePatch",
+    "onCommand:wuu.markPatchApplied",
+    "onCommand:wuu.removePatch",
+    "onCommand:wuu.focusPatchInbox"
   ],
   "main": "./out/extension",
   "scripts": {
@@ -52,6 +56,10 @@
         {
           "id": "wuu.tasks",
           "name": "%view.tasks.name%"
+        },
+        {
+          "id": "wuu.patches",
+          "name": "%view.patches.name%"
         }
       ]
     },
@@ -59,6 +67,10 @@
       {
         "view": "wuu.tasks",
         "contents": "%view.tasks.welcome%"
+      },
+      {
+        "view": "wuu.patches",
+        "contents": "%view.patches.welcome%"
       }
     ],
     "commands": [
@@ -126,6 +138,26 @@
         "command": "wuu.applyPatch",
         "category": "%command.category%",
         "title": "%command.applyPatch%"
+      },
+      {
+        "command": "wuu.requeuePatch",
+        "category": "%command.category%",
+        "title": "%command.requeuePatch%"
+      },
+      {
+        "command": "wuu.markPatchApplied",
+        "category": "%command.category%",
+        "title": "%command.markPatchApplied%"
+      },
+      {
+        "command": "wuu.removePatch",
+        "category": "%command.category%",
+        "title": "%command.removePatch%"
+      },
+      {
+        "command": "wuu.focusPatchInbox",
+        "category": "%command.category%",
+        "title": "%command.focusPatchInbox%"
       }
     ],
     "menus": {
@@ -154,6 +186,11 @@
           "command": "wuu.applyPatch",
           "when": "view == wuu.tasks",
           "group": "navigation@4"
+        },
+        {
+          "command": "wuu.refreshTasks",
+          "when": "view == wuu.patches",
+          "group": "navigation"
         }
       ],
       "view/item/context": [
@@ -210,6 +247,31 @@
         {
           "command": "wuu.removeSession",
           "when": "view == wuu.tasks && (viewItem == wuuSessionRunning || viewItem == wuuSessionIdle || viewItem == wuuSessionRetry)",
+          "group": "navigation@9"
+        },
+        {
+          "command": "wuu.previewPatch",
+          "when": "view == wuu.patches && (viewItem == wuuPatchPending || viewItem == wuuPatchConflict || viewItem == wuuPatchApplied)",
+          "group": "navigation"
+        },
+        {
+          "command": "wuu.applyPatch",
+          "when": "view == wuu.patches && (viewItem == wuuPatchPending || viewItem == wuuPatchConflict)",
+          "group": "inline"
+        },
+        {
+          "command": "wuu.markPatchApplied",
+          "when": "view == wuu.patches && (viewItem == wuuPatchPending || viewItem == wuuPatchConflict)",
+          "group": "navigation@1"
+        },
+        {
+          "command": "wuu.requeuePatch",
+          "when": "view == wuu.patches && (viewItem == wuuPatchConflict || viewItem == wuuPatchApplied)",
+          "group": "navigation@2"
+        },
+        {
+          "command": "wuu.removePatch",
+          "when": "view == wuu.patches && (viewItem == wuuPatchPending || viewItem == wuuPatchConflict || viewItem == wuuPatchApplied || viewItem == wuuPatchUnsupported)",
           "group": "navigation@9"
         }
       ]

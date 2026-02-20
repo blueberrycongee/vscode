@@ -67,6 +67,11 @@ interface WuuSessionState {
 	pty?: WuuPtyInfo;
 }
 
+interface WuuPatchState {
+	patch: WuuPatchRecord;
+	task: WuuTaskRecord | undefined;
+}
+
 interface GitRepositoryApi {
 	rootUri: Uri;
 	apply(patch: string, options?: { allowEmpty?: boolean; reverse?: boolean; threeWay?: boolean }): Promise<void>;
@@ -81,6 +86,9 @@ interface GitExtensionApi {
 }
 
 type WuuTreeItem = WuuTaskItem | WuuSessionItem;
+type WuuPatchTreeItem = WuuPatchSectionItem | WuuPatchItem;
+
+const PATCH_STATUS_ORDER: WuuPatchStatus[] = ['conflict', 'pending', 'applied', 'unsupported'];
 
 class WuuTaskItem extends TreeItem {
 	constructor(
@@ -186,6 +194,99 @@ class WuuTreeProvider implements TreeDataProvider<WuuTreeItem> {
 	}
 }
 
+class WuuPatchSectionItem extends TreeItem {
+	constructor(
+		public readonly status: WuuPatchStatus,
+		public readonly count: number,
+	) {
+		super(l10n.t('{0} ({1})', patchStatusLabel(status), count), TreeItemCollapsibleState.Expanded);
+		this.contextValue = 'wuuPatchSection';
+		if (status === 'conflict') {
+			this.iconPath = new ThemeIcon('warning');
+		} else if (status === 'pending') {
+			this.iconPath = new ThemeIcon('clock');
+		} else if (status === 'applied') {
+			this.iconPath = new ThemeIcon('pass-filled');
+		} else {
+			this.iconPath = new ThemeIcon('circle-slash');
+		}
+	}
+}
+
+class WuuPatchItem extends TreeItem {
+	constructor(public readonly state: WuuPatchState) {
+		super(state.task?.title ?? l10n.t('Missing task'), TreeItemCollapsibleState.None);
+		this.contextValue = toPatchContextValue(state.patch.status);
+		this.description = l10n.t('{0} · {1} files', state.patch.sourceBranch, state.patch.changedFiles);
+		this.tooltip = toPatchTooltip(state);
+		this.iconPath = patchIcon(state.patch.status);
+		if (state.patch.patchPath) {
+			this.command = {
+				command: 'wuu.previewPatch',
+				title: l10n.t('Preview Patch'),
+				arguments: [this],
+			};
+		}
+	}
+}
+
+class WuuPatchInboxProvider implements TreeDataProvider<WuuPatchTreeItem> {
+	private readonly onDidChangeTreeDataEmitter = new EventEmitter<WuuPatchTreeItem | null>();
+	readonly onDidChangeTreeData: Event<WuuPatchTreeItem | null> = this.onDidChangeTreeDataEmitter.event;
+	private patchesByStatus = new Map<WuuPatchStatus, WuuPatchState[]>();
+
+	setData(patches: WuuPatchState[]): void {
+		const map = new Map<WuuPatchStatus, WuuPatchState[]>();
+		for (const status of PATCH_STATUS_ORDER) {
+			map.set(status, []);
+		}
+
+		for (const patch of patches) {
+			const list = map.get(patch.patch.status) ?? [];
+			list.push(patch);
+			map.set(patch.patch.status, list);
+		}
+
+		for (const [status, entries] of map.entries()) {
+			entries.sort((a, b) => b.patch.createdAt.localeCompare(a.patch.createdAt));
+			map.set(status, entries);
+		}
+
+		this.patchesByStatus = map;
+		this.onDidChangeTreeDataEmitter.fire(null);
+	}
+
+	getTreeItem(element: WuuPatchTreeItem): TreeItem {
+		return element;
+	}
+
+	getParent(element: WuuPatchTreeItem): WuuPatchTreeItem | null {
+		if (element instanceof WuuPatchSectionItem) {
+			return null;
+		}
+
+		const count = (this.patchesByStatus.get(element.state.patch.status) ?? []).length;
+		return new WuuPatchSectionItem(element.state.patch.status, count);
+	}
+
+	getChildren(element?: WuuPatchTreeItem): WuuPatchTreeItem[] {
+		if (!element) {
+			return PATCH_STATUS_ORDER
+				.map(status => {
+					const entries = this.patchesByStatus.get(status) ?? [];
+					return entries.length > 0 ? new WuuPatchSectionItem(status, entries.length) : undefined;
+				})
+				.filter((entry): entry is WuuPatchSectionItem => Boolean(entry));
+		}
+
+		if (element instanceof WuuPatchSectionItem) {
+			return (this.patchesByStatus.get(element.status) ?? []).map(entry => new WuuPatchItem(entry));
+		}
+
+		return [];
+	}
+}
+
 class WuuStore {
 	constructor(private readonly context: ExtensionContext) { }
 
@@ -240,20 +341,22 @@ class WuuStore {
 
 export function activate(context: ExtensionContext): void {
 	const store = new WuuStore(context);
-	const provider = new WuuTreeProvider();
+	const taskProvider = new WuuTreeProvider();
+	const patchProvider = new WuuPatchInboxProvider();
 	const ptyManager = new WuuPtyManager();
 	const patchStore = new WuuPatchStore();
 	const statusStore = new WuuSessionStatusStore(store.getSessionStatuses());
 
 	context.subscriptions.push(
 		ptyManager,
-		window.createTreeView('wuu.tasks', { treeDataProvider: provider }),
+		window.createTreeView('wuu.tasks', { treeDataProvider: taskProvider }),
+		window.createTreeView('wuu.patches', { treeDataProvider: patchProvider }),
 		commands.registerCommand('wuu.createTask', async () => {
 			await createTask(store);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.refreshTasks', async () => {
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openTask', async (item?: WuuTaskItem) => {
 			const selected = item?.state.task ?? await pickTask(store);
@@ -270,7 +373,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await removeTask(selected, store, patchStore, statusStore, ptyManager);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.createSession', async (item?: WuuTaskItem) => {
 			const selectedTask = item?.state.task ?? await pickTask(store);
@@ -279,7 +382,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await createSession(selectedTask, store, statusStore, ptyManager);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.startSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -288,7 +391,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await startSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.stopSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -297,7 +400,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await stopSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openSessionTerminal', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -306,7 +409,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await openSessionTerminal(selectedSession, store, statusStore, ptyManager);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.removeSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -315,7 +418,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await removeSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.exportTaskPatch', async (item?: WuuTaskItem) => {
 			const task = item?.state.task ?? await pickTask(store);
@@ -324,39 +427,70 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await exportTaskPatch(task, patchStore);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
-		commands.registerCommand('wuu.previewPatch', async (item?: WuuTaskItem) => {
-			const patch = await pickPatch(store, patchStore, { taskId: item?.state.task.id });
+		commands.registerCommand('wuu.previewPatch', async (item?: WuuTaskItem | WuuPatchItem) => {
+			const patch = await resolvePatchSelection(item, store, patchStore, undefined);
 			if (!patch) {
 				return;
 			}
 
 			await previewPatch(patch);
 		}),
-		commands.registerCommand('wuu.applyPatch', async (item?: WuuTaskItem) => {
-			const patch = await pickPatch(store, patchStore, { taskId: item?.state.task.id, statuses: ['pending', 'conflict'] });
+		commands.registerCommand('wuu.applyPatch', async (item?: WuuTaskItem | WuuPatchItem) => {
+			const patch = await resolvePatchSelection(item, store, patchStore, ['pending', 'conflict']);
 			if (!patch) {
 				return;
 			}
 
 			await applyPatchToWorkspace(patch, patchStore);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.requeuePatch', async (item?: WuuPatchItem) => {
+			const patch = item?.state.patch ?? await pickPatch(store, patchStore, { statuses: ['conflict', 'applied'] });
+			if (!patch) {
+				return;
+			}
+
+			await requeuePatch(patch, patchStore);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.markPatchApplied', async (item?: WuuPatchItem) => {
+			const patch = item?.state.patch ?? await pickPatch(store, patchStore, { statuses: ['conflict', 'pending'] });
+			if (!patch) {
+				return;
+			}
+
+			await markPatchApplied(patch, patchStore);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.removePatch', async (item?: WuuPatchItem) => {
+			const patch = item?.state.patch ?? await pickPatch(store, patchStore);
+			if (!patch) {
+				return;
+			}
+
+			await removePatchRecord(patch, patchStore);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.focusPatchInbox', async () => {
+			await commands.executeCommand('wuu.patches.focus');
 		}),
 		ptyManager.onDidExit(async event => {
 			await setSessionStatus(event.sessionId, { type: 'idle' }, statusStore, store);
-			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 		}),
 	);
 
-	void initializeView(provider, store, patchStore, statusStore, ptyManager);
+	void initializeView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 }
 
 export function deactivate(): void {
 }
 
 async function initializeView(
-	provider: WuuTreeProvider,
+	taskProvider: WuuTreeProvider,
+	patchProvider: WuuPatchInboxProvider,
 	store: WuuStore,
 	patchStore: WuuPatchStore,
 	statusStore: WuuSessionStatusStore,
@@ -368,7 +502,7 @@ async function initializeView(
 		}
 	}
 	await store.saveSessionStatuses(statusStore.list());
-	await refreshView(provider, store, patchStore, statusStore, ptyManager);
+	await refreshView(taskProvider, patchProvider, store, patchStore, statusStore, ptyManager);
 }
 
 async function createTask(store: WuuStore): Promise<void> {
@@ -791,8 +925,126 @@ async function applyPatchToWorkspace(patch: WuuPatchRecord, patchStore: WuuPatch
 			status: 'conflict',
 			error: message,
 		}));
-		window.showErrorMessage(l10n.t('Patch apply failed: {0}', message));
+		const openPatchInboxAction = l10n.t('Open Patch Inbox');
+		const openScmAction = l10n.t('Open Source Control');
+		const previewAction = l10n.t('Preview Patch');
+		const selection = await window.showErrorMessage(
+			l10n.t('Patch apply failed and was moved to conflict: {0}', message),
+			openPatchInboxAction,
+			openScmAction,
+			previewAction,
+		);
+		if (selection === openPatchInboxAction) {
+			await commands.executeCommand('wuu.patches.focus');
+		} else if (selection === openScmAction) {
+			await commands.executeCommand('workbench.view.scm');
+		} else if (selection === previewAction) {
+			await previewPatch(patch);
+		}
 	}
+}
+
+async function markPatchApplied(patch: WuuPatchRecord, patchStore: WuuPatchStore): Promise<void> {
+	if (patch.status === 'unsupported') {
+		window.showErrorMessage(l10n.t('Unsupported patch entries cannot be marked as applied.'));
+		return;
+	}
+
+	const workspaceFolder = getPrimaryWorkspaceFolder();
+	if (!workspaceFolder) {
+		window.showErrorMessage(l10n.t('Open the target workspace before updating patch status.'));
+		return;
+	}
+
+	let currentRepoRoot: string;
+	try {
+		currentRepoRoot = await resolveRepositoryRoot(workspaceFolder.uri.fsPath);
+	} catch (error) {
+		window.showErrorMessage(l10n.t('The current workspace is not a git repository: {0}', asErrorMessage(error)));
+		return;
+	}
+
+	if (currentRepoRoot !== patch.repoRoot) {
+		window.showErrorMessage(l10n.t('Patch repository mismatch. Open the primary repository workspace first.'));
+		return;
+	}
+
+	const unresolved = (await runGit(['diff', '--name-only', '--diff-filter=U'], currentRepoRoot)).stdout
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean);
+	if (unresolved.length > 0) {
+		const openScmAction = l10n.t('Open Source Control');
+		const selection = await window.showWarningMessage(
+			l10n.t('Resolve merge conflicts before marking as applied. Unmerged files: {0}', unresolved.length),
+			openScmAction,
+		);
+		if (selection === openScmAction) {
+			await commands.executeCommand('workbench.view.scm');
+		}
+		return;
+	}
+
+	const appliedBranch = await getCurrentBranch(currentRepoRoot);
+	await patchStore.update(patch.repoRoot, patch.id, current => ({
+		...current,
+		status: 'applied',
+		appliedAt: new Date().toISOString(),
+		appliedBranch,
+		error: undefined,
+	}));
+	window.showInformationMessage(l10n.t('Patch marked as applied on branch {0}.', appliedBranch));
+}
+
+async function requeuePatch(patch: WuuPatchRecord, patchStore: WuuPatchStore): Promise<void> {
+	if (patch.status === 'unsupported') {
+		window.showErrorMessage(l10n.t('Unsupported patch entries cannot be requeued.'));
+		return;
+	}
+
+	await patchStore.update(patch.repoRoot, patch.id, current => ({
+		...current,
+		status: 'pending',
+		error: undefined,
+	}));
+	window.showInformationMessage(l10n.t('Patch moved back to pending.'));
+}
+
+async function removePatchRecord(patch: WuuPatchRecord, patchStore: WuuPatchStore): Promise<void> {
+	const removeLabel = l10n.t('Remove Patch');
+	const selection = await window.showWarningMessage(
+		l10n.t('Remove this patch record?'),
+		{ modal: true },
+		removeLabel,
+	);
+	if (selection !== removeLabel) {
+		return;
+	}
+
+	const removed = await patchStore.remove(patch.repoRoot, patch.id);
+	if (!removed) {
+		window.showWarningMessage(l10n.t('Patch record was not found.'));
+	}
+}
+
+async function resolvePatchSelection(
+	item: WuuTaskItem | WuuPatchItem | undefined,
+	store: WuuStore,
+	patchStore: WuuPatchStore,
+	statuses?: WuuPatchStatus[],
+): Promise<WuuPatchRecord | undefined> {
+	if (item instanceof WuuPatchItem) {
+		if (statuses && !statuses.includes(item.state.patch.status)) {
+			window.showInformationMessage(l10n.t('This patch is not eligible for the selected action.'));
+			return undefined;
+		}
+		return item.state.patch;
+	}
+
+	return await pickPatch(store, patchStore, {
+		taskId: item?.state.task.id,
+		statuses,
+	});
 }
 
 async function pickPatch(
@@ -841,7 +1093,8 @@ async function listPatchesForKnownTasks(store: WuuStore, patchStore: WuuPatchSto
 }
 
 async function refreshView(
-	provider: WuuTreeProvider,
+	taskProvider: WuuTreeProvider,
+	patchProvider: WuuPatchInboxProvider,
 	store: WuuStore,
 	patchStore: WuuPatchStore,
 	statusStore: WuuSessionStatusStore,
@@ -863,7 +1116,13 @@ async function refreshView(
 		} satisfies WuuSessionState;
 	});
 
-	provider.setData(taskStates, sessionStates);
+	const patchStates = (await listPatchesForKnownTasks(store, patchStore)).map(patch => ({
+		patch,
+		task: taskMap.get(patch.taskId),
+	}));
+
+	taskProvider.setData(taskStates, sessionStates);
+	patchProvider.setData(patchStates);
 }
 
 async function inspectTask(task: WuuTaskRecord, patchSummary: WuuPatchSummary): Promise<WuuTaskState> {
@@ -1010,6 +1269,45 @@ function createPatchId(): string {
 	return `patch-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function patchStatusLabel(status: WuuPatchStatus): string {
+	switch (status) {
+		case 'conflict':
+			return l10n.t('Conflicts');
+		case 'pending':
+			return l10n.t('Pending');
+		case 'applied':
+			return l10n.t('Applied');
+		case 'unsupported':
+			return l10n.t('Unsupported');
+	}
+}
+
+function patchIcon(status: WuuPatchStatus): ThemeIcon {
+	switch (status) {
+		case 'conflict':
+			return new ThemeIcon('warning');
+		case 'pending':
+			return new ThemeIcon('clock');
+		case 'applied':
+			return new ThemeIcon('pass-filled');
+		case 'unsupported':
+			return new ThemeIcon('circle-slash');
+	}
+}
+
+function toPatchContextValue(status: WuuPatchStatus): string {
+	switch (status) {
+		case 'conflict':
+			return 'wuuPatchConflict';
+		case 'pending':
+			return 'wuuPatchPending';
+		case 'applied':
+			return 'wuuPatchApplied';
+		case 'unsupported':
+			return 'wuuPatchUnsupported';
+	}
+}
+
 function patchLabel(patch: WuuPatchRecord): string {
 	return `${patch.status.toUpperCase()} · ${new Date(patch.createdAt).toLocaleString()}`;
 }
@@ -1018,6 +1316,34 @@ function patchDetails(patch: WuuPatchRecord): string {
 	const unsupported = patch.unsupportedFiles.length > 0 ? ` · unsupported ${patch.unsupportedFiles.length}` : '';
 	const suffix = patch.patchPath ? patch.patchPath : l10n.t('No patch file');
 	return `${patch.changedFiles} files${unsupported} · ${suffix}`;
+}
+
+function toPatchTooltip(state: WuuPatchState): string {
+	const lines = [
+		`${l10n.t('Task')}: ${state.task?.title ?? l10n.t('Missing task')}`,
+		`${l10n.t('Source branch')}: ${state.patch.sourceBranch}`,
+		`${l10n.t('Status')}: ${patchStatusLabel(state.patch.status)}`,
+		`${l10n.t('Changed files')}: ${state.patch.changedFiles}`,
+		`${l10n.t('Created')}: ${state.patch.createdAt}`,
+	];
+
+	if (state.patch.appliedAt) {
+		lines.push(`${l10n.t('Applied at')}: ${state.patch.appliedAt}`);
+	}
+	if (state.patch.appliedBranch) {
+		lines.push(`${l10n.t('Applied branch')}: ${state.patch.appliedBranch}`);
+	}
+	if (state.patch.error) {
+		lines.push(`${l10n.t('Error')}: ${state.patch.error}`);
+	}
+	if (state.patch.unsupportedFiles.length > 0) {
+		lines.push(`${l10n.t('Unsupported files')}: ${state.patch.unsupportedFiles.length}`);
+	}
+	if (state.patch.patchPath) {
+		lines.push(`${l10n.t('Patch path')}: ${state.patch.patchPath}`);
+	}
+
+	return lines.join('\n');
 }
 
 function parseNumstatLine(line: string): { additions: string; deletions: string; filePath: string } | undefined {
