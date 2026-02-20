@@ -19,7 +19,6 @@
   },
   "activationEvents": [
     "onView:wuu.tasks",
-    "onView:wuu.sessions",
     "onCommand:wuu.createTask",
     "onCommand:wuu.createSession",
     "onCommand:wuu.refreshTasks",
@@ -38,7 +37,7 @@
     "onCommand:wuu.focusPatchInbox",
     "onCommand:wuu.openSessionTerminalEditor",
     "onCommand:wuu.quickReplySession",
-    "onCommand:wuu.focusSessions"
+    "onCommand:wuu.openDashboard"
   ],
   "main": "./out/extension",
   "scripts": {
@@ -53,13 +52,6 @@
           "title": "%viewContainer.wuu.title%",
           "icon": "media/wuu.svg"
         }
-      ],
-      "secondarySidebar": [
-        {
-          "id": "wuu_secondary",
-          "title": "%viewContainer.wuu.secondary.title%",
-          "icon": "media/wuu.svg"
-        }
       ]
     },
     "views": {
@@ -72,13 +64,6 @@
           "id": "wuu.patches",
           "name": "%view.patches.name%"
         }
-      ],
-      "wuu_secondary": [
-        {
-          "type": "webview",
-          "id": "wuu.sessions",
-          "name": "%view.sessions.name%"
-        }
       ]
     },
     "viewsWelcome": [
@@ -89,10 +74,6 @@
       {
         "view": "wuu.patches",
         "contents": "%view.patches.welcome%"
-      },
-      {
-        "view": "wuu.sessions",
-        "contents": "%view.sessions.welcome%"
       }
     ],
     "commands": [
@@ -192,9 +173,9 @@
         "title": "%command.focusPatchInbox%"
       },
       {
-        "command": "wuu.focusSessions",
+        "command": "wuu.openDashboard",
         "category": "%command.category%",
-        "title": "%command.focusSessions%"
+        "title": "%command.openDashboard%"
       }
     ],
     "menus": {
@@ -230,14 +211,9 @@
           "group": "navigation"
         },
         {
-          "command": "wuu.createSession",
-          "when": "view == wuu.sessions",
-          "group": "navigation"
-        },
-        {
-          "command": "wuu.focusSessions",
-          "when": "view == wuu.sessions",
-          "group": "navigation@1"
+          "command": "wuu.openDashboard",
+          "when": "view == wuu.tasks || view == wuu.patches",
+          "group": "navigation@9"
         }
       ],
       "view/item/context": [

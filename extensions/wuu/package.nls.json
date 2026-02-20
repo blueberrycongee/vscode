@@ -2,13 +2,10 @@
 	"displayName": "Wuu",
 	"description": "Worktree-first task panel for parallel AI coding.",
 	"viewContainer.wuu.title": "Wuu",
-	"viewContainer.wuu.secondary.title": "Wuu Sessions",
 	"view.tasks.name": "Tasks",
 	"view.patches.name": "Patch Inbox",
-	"view.sessions.name": "Sessions",
 	"view.tasks.welcome": "No tasks yet. [Create Task](command:wuu.createTask)",
 	"view.patches.welcome": "No patches yet. Export one from a task.",
-	"view.sessions.welcome": "No sessions yet. Create one from Tasks.",
 	"command.category": "Wuu",
 	"command.createTask": "Create Task",
 	"command.refreshTasks": "Refresh Tasks",
@@ -28,6 +25,6 @@
 	"command.markPatchApplied": "Mark Patch as Applied",
 	"command.removePatch": "Remove Patch",
 	"command.focusPatchInbox": "Focus Patch Inbox",
-	"command.focusSessions": "Focus Sessions",
+	"command.openDashboard": "Open Wuu Dashboard",
 	"config.worktreesRoot": "Root directory for created worktrees. Supports `${workspaceFolder}` and `${repoRoot}` variables."
 }

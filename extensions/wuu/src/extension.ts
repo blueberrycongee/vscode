@@ -17,8 +17,8 @@ import {
 	TreeItem,
 	TreeItemCollapsibleState,
 	Uri,
-	WebviewView,
-	WebviewViewProvider,
+	ViewColumn,
+	WebviewPanel,
 	window,
 	workspace,
 	type Event,
@@ -71,19 +71,14 @@ interface WuuSessionState {
 	pty?: WuuPtyInfo;
 }
 
-interface WuuSessionHubEntry {
-	id: string;
-	name: string;
-	agent: string;
-	taskTitle: string;
-	statusLabel: string;
-	running: boolean;
-	createdAt: string;
-}
-
-type SessionViewMessage =
+type DashboardMessage =
+	| { type: 'createTask' }
+	| { type: 'openTask'; taskId: string }
+	| { type: 'createSession'; taskId: string }
 	| { type: 'openSession'; sessionId: string }
-	| { type: 'sendQuickReply'; sessionId: string; text: string };
+	| { type: 'quickReply'; sessionId: string; text: string }
+	| { type: 'focusPatchInbox' }
+	| { type: 'refresh' };
 
 interface WuuPatchState {
 	patch: WuuPatchRecord;
@@ -305,75 +300,91 @@ class WuuPatchInboxProvider implements TreeDataProvider<WuuPatchTreeItem> {
 	}
 }
 
-class WuuSessionsViewProvider implements WebviewViewProvider, Disposable {
-	private view: WebviewView | undefined;
-	private sessions: WuuSessionHubEntry[] = [];
+class WuuDashboardPanel implements Disposable {
+	private panel: WebviewPanel | undefined;
+	private taskStates: WuuTaskState[] = [];
+	private sessionStates: WuuSessionState[] = [];
+	private patchStates: WuuPatchState[] = [];
 
-	constructor(
-		private readonly openSession: (sessionId: string) => Promise<void>,
-		private readonly sendQuickReply: (sessionId: string, text: string) => Promise<void>,
-	) { }
+	constructor(private readonly callbacks: {
+		createTask: () => Promise<void>;
+		refresh: () => Promise<void>;
+		openTask: (taskId: string) => Promise<void>;
+		createSession: (taskId: string) => Promise<void>;
+		openSession: (sessionId: string) => Promise<void>;
+		quickReply: (sessionId: string, text: string) => Promise<void>;
+		focusPatchInbox: () => Promise<void>;
+	}) { }
 
 	dispose(): void {
-		this.view = undefined;
+		this.panel?.dispose();
+		this.panel = undefined;
 	}
 
-	setData(sessionStates: WuuSessionState[]): void {
-		this.sessions = sessionStates
-			.slice()
-			.sort((a, b) => b.session.createdAt.localeCompare(a.session.createdAt))
-			.map(sessionState => ({
-				id: sessionState.session.id,
-				name: sessionState.session.name,
-				agent: sessionState.session.agent,
-				taskTitle: sessionState.task?.title ?? l10n.t('Missing task'),
-				statusLabel: statusLabel(sessionState.status),
-				running: sessionState.running,
-				createdAt: sessionState.session.createdAt,
-			}));
-		void this.publish();
+	setData(taskStates: WuuTaskState[], sessionStates: WuuSessionState[], patchStates: WuuPatchState[]): void {
+		this.taskStates = taskStates;
+		this.sessionStates = sessionStates;
+		this.patchStates = patchStates;
+		this.render();
 	}
 
-	resolveWebviewView(webviewView: WebviewView): void {
-		this.view = webviewView;
-		webviewView.webview.options = {
-			enableScripts: true,
-		};
-		webviewView.description = l10n.t('Quick Reply + Open Terminal');
-		webviewView.badge = this.sessions.length > 0 ? { value: this.sessions.length, tooltip: l10n.t('Active Wuu sessions') } : undefined;
-		webviewView.webview.html = renderSessionsWebviewHtml(webviewView.webview);
+	open(): void {
+		if (!this.panel) {
+			this.panel = window.createWebviewPanel(
+				'wuu.dashboard',
+				l10n.t('Wuu Dashboard'),
+				ViewColumn.Active,
+				{
+					enableScripts: true,
+					retainContextWhenHidden: true,
+				},
+			);
 
-		webviewView.webview.onDidReceiveMessage(async (message: SessionViewMessage) => {
-			try {
-				if (message.type === 'openSession') {
-					await this.openSession(message.sessionId);
-				} else if (message.type === 'sendQuickReply') {
-					await this.sendQuickReply(message.sessionId, message.text);
+			this.panel.onDidDispose(() => {
+				this.panel = undefined;
+			});
+
+			this.panel.webview.onDidReceiveMessage(async (message: DashboardMessage) => {
+				if (!message || typeof message !== 'object') {
+					return;
 				}
-			} finally {
-				await this.publish();
-			}
-		});
 
-		webviewView.onDidDispose(() => {
-			if (this.view === webviewView) {
-				this.view = undefined;
-			}
-		});
+				switch (message.type) {
+					case 'createTask':
+						await this.callbacks.createTask();
+						break;
+					case 'openTask':
+						await this.callbacks.openTask(message.taskId);
+						break;
+					case 'createSession':
+						await this.callbacks.createSession(message.taskId);
+						break;
+					case 'openSession':
+						await this.callbacks.openSession(message.sessionId);
+						break;
+					case 'quickReply':
+						await this.callbacks.quickReply(message.sessionId, message.text);
+						break;
+					case 'focusPatchInbox':
+						await this.callbacks.focusPatchInbox();
+						break;
+					case 'refresh':
+						await this.callbacks.refresh();
+						break;
+				}
+			});
+		}
 
-		void this.publish();
+		this.panel.reveal(ViewColumn.Active, false);
+		this.render();
 	}
 
-	private async publish(): Promise<void> {
-		if (!this.view) {
+	private render(): void {
+		if (!this.panel) {
 			return;
 		}
 
-		this.view.badge = this.sessions.length > 0 ? { value: this.sessions.length, tooltip: l10n.t('Active Wuu sessions') } : undefined;
-		await this.view.webview.postMessage({
-			type: 'sessions',
-			sessions: this.sessions,
-		});
+		this.panel.webview.html = renderDashboardWebviewHtml(this.panel.webview, this.taskStates, this.sessionStates, this.patchStates);
 	}
 }
 
@@ -436,27 +447,58 @@ export function activate(context: ExtensionContext): void {
 	const ptyManager = new WuuPtyManager();
 	const patchStore = new WuuPatchStore();
 	const statusStore = new WuuSessionStatusStore(store.getSessionStatuses());
-	const sessionsProvider = new WuuSessionsViewProvider(
-		async sessionId => {
+	const dashboardPanel = new WuuDashboardPanel({
+		createTask: async () => {
+			await createTask(store);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
+		},
+		refresh: async () => {
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
+		},
+		openTask: async (taskId: string) => {
+			const task = store.getTasks().find(item => item.id === taskId);
+			if (!task) {
+				window.showErrorMessage(l10n.t('Task no longer exists.'));
+				return;
+			}
+			await commands.executeCommand('vscode.openFolder', Uri.file(task.worktreePath), true);
+		},
+		createSession: async (taskId: string) => {
+			const task = store.getTasks().find(item => item.id === taskId);
+			if (!task) {
+				window.showErrorMessage(l10n.t('Task no longer exists.'));
+				return;
+			}
+			await createSession(task, store, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
+		},
+		openSession: async (sessionId: string) => {
 			await openSessionTerminalById(sessionId, store, statusStore, ptyManager, true);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		},
-		async (sessionId, text) => {
+		quickReply: async (sessionId: string, text: string) => {
 			await quickReplySessionById(sessionId, text, store, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		},
-	);
+		focusPatchInbox: async () => {
+			await commands.executeCommand('wuu.patches.focus');
+		},
+	});
 
 	context.subscriptions.push(
 		ptyManager,
-		sessionsProvider,
+		dashboardPanel,
 		window.createTreeView('wuu.tasks', { treeDataProvider: taskProvider }),
 		window.createTreeView('wuu.patches', { treeDataProvider: patchProvider }),
-		window.registerWebviewViewProvider('wuu.sessions', sessionsProvider),
+		commands.registerCommand('wuu.openDashboard', () => {
+			dashboardPanel.open();
+		}),
 		commands.registerCommand('wuu.createTask', async () => {
 			await createTask(store);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.refreshTasks', async () => {
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openTask', async (item?: WuuTaskItem) => {
 			const selected = item?.state.task ?? await pickTask(store);
@@ -473,7 +515,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await removeTask(selected, store, patchStore, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.createSession', async (item?: WuuTaskItem) => {
 			const selectedTask = item?.state.task ?? await pickTask(store);
@@ -482,7 +524,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await createSession(selectedTask, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.startSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -491,7 +533,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await startSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.stopSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -500,7 +542,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await stopSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openSessionTerminal', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -509,7 +551,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await openSessionTerminal(selectedSession, store, statusStore, ptyManager, true);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openSessionTerminalEditor', async (item?: WuuSessionItem | string) => {
 			const selectedSessionId = typeof item === 'string' ? item : item?.state.session.id;
@@ -523,7 +565,7 @@ export function activate(context: ExtensionContext): void {
 				await openSessionTerminal(selectedSession, store, statusStore, ptyManager, true);
 			}
 
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.removeSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -532,7 +574,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await removeSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.exportTaskPatch', async (item?: WuuTaskItem) => {
 			const task = item?.state.task ?? await pickTask(store);
@@ -541,7 +583,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await exportTaskPatch(task, patchStore);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.previewPatch', async (item?: WuuTaskItem | WuuPatchItem) => {
 			const patch = await resolvePatchSelection(item, store, patchStore, undefined);
@@ -558,7 +600,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await applyPatchToWorkspace(patch, patchStore);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.requeuePatch', async (item?: WuuPatchItem) => {
 			const patch = item?.state.patch ?? await pickPatch(store, patchStore, { statuses: ['conflict', 'applied'] });
@@ -567,7 +609,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await requeuePatch(patch, patchStore);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.markPatchApplied', async (item?: WuuPatchItem) => {
 			const patch = item?.state.patch ?? await pickPatch(store, patchStore, { statuses: ['conflict', 'pending'] });
@@ -576,7 +618,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await markPatchApplied(patch, patchStore);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.removePatch', async (item?: WuuPatchItem) => {
 			const patch = item?.state.patch ?? await pickPatch(store, patchStore);
@@ -585,13 +627,10 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await removePatchRecord(patch, patchStore);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.focusPatchInbox', async () => {
 			await commands.executeCommand('wuu.patches.focus');
-		}),
-		commands.registerCommand('wuu.focusSessions', async () => {
-			await commands.executeCommand('wuu.sessions.focus');
 		}),
 		commands.registerCommand('wuu.quickReplySession', async (item?: WuuSessionItem | string) => {
 			const selectedSessionId = typeof item === 'string' ? item : item?.state.session.id;
@@ -610,15 +649,15 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await quickReplySession(selectedSession, text, store, statusStore, ptyManager);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 		ptyManager.onDidExit(async event => {
 			await setSessionStatus(event.sessionId, { type: 'idle' }, statusStore, store);
-			await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+			await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 		}),
 	);
 
-	void initializeView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+	void initializeView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
 }
 
 export function deactivate(): void {
@@ -627,7 +666,7 @@ export function deactivate(): void {
 async function initializeView(
 	taskProvider: WuuTreeProvider,
 	patchProvider: WuuPatchInboxProvider,
-	sessionsProvider: WuuSessionsViewProvider,
+	dashboardPanel: WuuDashboardPanel,
 	store: WuuStore,
 	patchStore: WuuPatchStore,
 	statusStore: WuuSessionStatusStore,
@@ -639,7 +678,8 @@ async function initializeView(
 		}
 	}
 	await store.saveSessionStatuses(statusStore.list());
-	await refreshView(taskProvider, patchProvider, sessionsProvider, store, patchStore, statusStore, ptyManager);
+	await refreshView(taskProvider, patchProvider, dashboardPanel, store, patchStore, statusStore, ptyManager);
+	dashboardPanel.open();
 }
 
 async function createTask(store: WuuStore): Promise<void> {
@@ -1282,7 +1322,7 @@ async function listPatchesForKnownTasks(store: WuuStore, patchStore: WuuPatchSto
 async function refreshView(
 	taskProvider: WuuTreeProvider,
 	patchProvider: WuuPatchInboxProvider,
-	sessionsProvider: WuuSessionsViewProvider,
+	dashboardPanel: WuuDashboardPanel,
 	store: WuuStore,
 	patchStore: WuuPatchStore,
 	statusStore: WuuSessionStatusStore,
@@ -1311,7 +1351,7 @@ async function refreshView(
 
 	taskProvider.setData(taskStates, sessionStates);
 	patchProvider.setData(patchStates);
-	sessionsProvider.setData(sessionStates);
+	dashboardPanel.setData(taskStates, sessionStates, patchStates);
 }
 
 async function inspectTask(task: WuuTaskRecord, patchSummary: WuuPatchSummary): Promise<WuuTaskState> {
@@ -1581,13 +1621,72 @@ async function getGitRepositoryApi(repoRoot: string): Promise<GitRepositoryApi |
 	return api.repositories.find(repository => repository.rootUri.fsPath === repoRoot);
 }
 
-function renderSessionsWebviewHtml(webview: Webview): string {
+function renderDashboardWebviewHtml(
+	webview: Webview,
+	taskStates: WuuTaskState[],
+	sessionStates: WuuSessionState[],
+	patchStates: WuuPatchState[],
+): string {
 	const nonce = createNonce();
-	const noSessionsText = JSON.stringify(l10n.t("No sessions yet. Create one from Wuu Tasks."));
-	const runningText = JSON.stringify(l10n.t("running"));
-	const quickReplyPlaceholder = JSON.stringify(l10n.t("Quick reply (Enter to send)"));
-	const sendLabel = JSON.stringify(l10n.t("Send"));
-	const openLabel = JSON.stringify(l10n.t("Open"));
+	const sessionsByTask = new Map<string, WuuSessionState[]>();
+	for (const session of sessionStates) {
+		const list = sessionsByTask.get(session.session.taskId) ?? [];
+		list.push(session);
+		sessionsByTask.set(session.session.taskId, list);
+	}
+
+	const data = {
+		tasks: taskStates
+			.slice()
+			.sort((a, b) => b.task.createdAt.localeCompare(a.task.createdAt))
+			.map(taskState => ({
+				id: taskState.task.id,
+				title: taskState.task.title,
+				branch: taskState.task.branch,
+				worktreePath: taskState.task.worktreePath,
+				health: taskState.health,
+				healthLabel: taskHealthLabel(taskState.health),
+				changedFiles: taskState.changedFiles,
+				patchSummary: taskState.patchSummary,
+				sessions: (sessionsByTask.get(taskState.task.id) ?? [])
+					.slice()
+					.sort((a, b) => a.session.createdAt.localeCompare(b.session.createdAt))
+					.map(sessionState => ({
+						id: sessionState.session.id,
+						name: sessionState.session.name,
+						agent: sessionState.session.agent,
+						status: statusLabel(sessionState.status),
+						running: sessionState.running,
+					})),
+			})),
+		patchInbox: summarizePatchStates(patchStates),
+		labels: {
+			title: l10n.t('Wuu Dashboard'),
+			subtitle: l10n.t('Worktree-first parallel agent workspace'),
+			patchInbox: l10n.t('Patch Inbox'),
+			patchPending: l10n.t('Pending'),
+			patchConflict: l10n.t('Conflict'),
+			patchApplied: l10n.t('Applied'),
+			patchUnsupported: l10n.t('Unsupported'),
+			createTask: l10n.t('Create Task'),
+			refresh: l10n.t('Refresh'),
+			openPatchInbox: l10n.t('Open Patch Inbox'),
+			openTask: l10n.t('Open Worktree'),
+			createSession: l10n.t('Create Session'),
+			openSession: l10n.t('Open Terminal'),
+			send: l10n.t('Send'),
+			quickReplyPlaceholder: l10n.t('Quick reply (Enter sends)'),
+			noTasks: l10n.t('No tasks yet. Create one to start parallel worktrees.'),
+			noSessions: l10n.t('No sessions yet for this task.'),
+			sessions: l10n.t('Sessions'),
+			changedFiles: l10n.t('Changed files'),
+			branch: l10n.t('Branch'),
+			worktree: l10n.t('Worktree'),
+			running: l10n.t('running'),
+			idle: l10n.t('idle'),
+		},
+	};
+	const dataJson = toWebviewJson(data);
 	const quote = String.fromCharCode(39);
 	const csp = [
 		`default-src ${quote}none${quote}`,
@@ -1602,47 +1701,145 @@ function renderSessionsWebviewHtml(webview: Webview): string {
 	<meta charset="UTF-8" />
 	<meta http-equiv="Content-Security-Policy" content="${csp}" />
 	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<title>${l10n.t('Wuu Dashboard')}</title>
 	<style>
 		:root {
 			color-scheme: light dark;
 		}
 		body {
 			margin: 0;
-			padding: 12px;
+			padding: 16px;
 			font-family: var(--vscode-font-family);
-			background: var(--vscode-sideBar-background);
-			color: var(--vscode-sideBar-foreground);
+			background: var(--vscode-editor-background);
+			color: var(--vscode-editor-foreground);
 		}
-		#sessions {
+		.page {
 			display: flex;
 			flex-direction: column;
-			gap: 10px;
-		}
-		.session {
-			display: grid;
-			gap: 8px;
-			padding: 10px;
-			border-radius: 12px;
-			border: 1px solid var(--vscode-sideBar-border);
-			background: color-mix(in srgb, var(--vscode-editor-background) 90%, transparent);
-			cursor: pointer;
+			gap: 16px;
 		}
 		.header {
 			display: flex;
+			align-items: flex-start;
 			justify-content: space-between;
-			align-items: center;
-			gap: 8px;
+			gap: 10px;
 		}
 		.title {
+			font-size: 18px;
+			font-weight: 700;
+		}
+		.subtitle {
+			font-size: 12px;
+			opacity: 0.75;
+			margin-top: 4px;
+		}
+		.actions {
+			display: flex;
+			gap: 8px;
+		}
+		.patch {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 10px;
+			border: 1px solid var(--vscode-panel-border);
+			border-radius: 10px;
+			padding: 10px 12px;
+			background: color-mix(in srgb, var(--vscode-editorWidget-background) 65%, transparent);
+		}
+		.patch-stats {
+			display: flex;
+			gap: 10px;
+			font-size: 12px;
+		}
+		.tasks {
+			display: grid;
+			gap: 12px;
+		}
+		.task {
+			border: 1px solid var(--vscode-panel-border);
+			border-radius: 12px;
+			padding: 12px;
+			gap: 8px;
+			background: color-mix(in srgb, var(--vscode-editorWidget-background) 70%, transparent);
+		}
+		.task-top {
+			display: flex;
+			justify-content: space-between;
+			gap: 10px;
+		}
+		.task-name {
+			font-size: 14px;
 			font-weight: 600;
 		}
-		.meta {
+		.meta-grid {
+			display: grid;
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+			gap: 8px;
 			font-size: 12px;
 			opacity: 0.8;
 		}
-		.row {
+		.badges {
+			display: flex;
+			gap: 8px;
+			flex-wrap: wrap;
+		}
+		.badge {
+			font-size: 11px;
+			border: 1px solid var(--vscode-panel-border);
+			border-radius: 99px;
+			padding: 2px 8px;
+			opacity: 0.85;
+		}
+		.btn {
+			border: 1px solid var(--vscode-button-border, transparent);
+			background: var(--vscode-button-background);
+			color: var(--vscode-button-foreground);
+			border-radius: 8px;
+			padding: 6px 10px;
+			cursor: pointer;
+		}
+		.btn.secondary {
+			background: var(--vscode-button-secondaryBackground);
+			color: var(--vscode-button-secondaryForeground);
+		}
+		.btn.inline {
+			padding: 4px 8px;
+			font-size: 12px;
+		}
+		.task-actions {
+			display: flex;
+			gap: 8px;
+		}
+		.sessions {
+			display: grid;
+			gap: 8px;
+			margin-top: 8px;
+		}
+		.session {
+			border: 1px solid var(--vscode-panel-border);
+			border-radius: 10px;
+			padding: 8px;
+			background: color-mix(in srgb, var(--vscode-editor-background) 90%, transparent);
+		}
+		.session-header {
+			display: flex;
+			justify-content: space-between;
+			gap: 10px;
+			align-items: center;
+		}
+		.session-title {
+			font-weight: 600;
+			font-size: 12px;
+		}
+		.session-meta {
+			font-size: 11px;
+			opacity: 0.8;
+		}
+		.reply-row {
 			display: flex;
 			gap: 6px;
+			margin-top: 8px;
 		}
 		.quick {
 			flex: 1;
@@ -1653,70 +1850,190 @@ function renderSessionsWebviewHtml(webview: Webview): string {
 			border-radius: 8px;
 			padding: 6px 8px;
 		}
-		.btn {
-			border: 1px solid var(--vscode-button-border, transparent);
-			background: var(--vscode-button-background);
-			color: var(--vscode-button-foreground);
-			border-radius: 8px;
-			padding: 6px 10px;
+		.health {
+			font-size: 11px;
+			padding: 2px 8px;
+			border-radius: 99px;
+			border: 1px solid var(--vscode-panel-border);
+		}
+		.health.ready {
+			color: var(--vscode-testing-iconPassed);
+		}
+		.health.missing, .health.error {
+			color: var(--vscode-testing-iconFailed);
 		}
 		.empty {
 			padding: 14px;
 			border-radius: 10px;
-			border: 1px dashed var(--vscode-sideBar-border);
+			border: 1px dashed var(--vscode-panel-border);
 			opacity: 0.8;
+		}
+		@media (max-width: 900px) {
+			.meta-grid {
+				grid-template-columns: 1fr;
+			}
+			.header {
+				flex-direction: column;
+				align-items: flex-start;
+			}
 		}
 	</style>
 </head>
 <body>
-	<div id="sessions"></div>
+	<div class="page">
+		<div class="header">
+			<div>
+				<div class="title" id="title"></div>
+				<div class="subtitle" id="subtitle"></div>
+			</div>
+			<div class="actions">
+				<button class="btn secondary" id="refresh"></button>
+				<button class="btn" id="createTask"></button>
+			</div>
+		</div>
+		<div class="patch">
+			<div>
+				<div class="task-name" id="patchTitle"></div>
+				<div class="patch-stats" id="patchStats"></div>
+			</div>
+			<button class="btn secondary" id="patchInbox"></button>
+		</div>
+		<div class="tasks" id="tasks"></div>
+	</div>
 	<script nonce="${nonce}">
 		const vscode = acquireVsCodeApi();
-		const sessionsRoot = document.getElementById('sessions');
-		let sessions = [];
+		const state = ${dataJson};
+		const tasksRoot = document.getElementById('tasks');
 
-		function render() {
-			sessionsRoot.innerHTML = '';
-			if (!sessions.length) {
+		function post(message) {
+			vscode.postMessage(message);
+		}
+
+		function setHeader() {
+			document.getElementById('title').textContent = state.labels.title;
+			document.getElementById('subtitle').textContent = state.labels.subtitle;
+			document.getElementById('patchTitle').textContent = state.labels.patchInbox;
+			document.getElementById('refresh').textContent = state.labels.refresh;
+			document.getElementById('createTask').textContent = state.labels.createTask;
+			document.getElementById('patchInbox').textContent = state.labels.openPatchInbox;
+			document.getElementById('refresh').addEventListener('click', () => post({ type: 'refresh' }));
+			document.getElementById('createTask').addEventListener('click', () => post({ type: 'createTask' }));
+			document.getElementById('patchInbox').addEventListener('click', () => post({ type: 'focusPatchInbox' }));
+
+			const patchStats = document.getElementById('patchStats');
+			patchStats.innerHTML = '';
+			const metrics = [
+				[state.labels.patchPending, state.patchInbox.pending],
+				[state.labels.patchConflict, state.patchInbox.conflict],
+				[state.labels.patchApplied, state.patchInbox.applied],
+				[state.labels.patchUnsupported, state.patchInbox.unsupported],
+			];
+			for (const metric of metrics) {
+				const el = document.createElement('div');
+				el.textContent = metric[0] + ': ' + metric[1];
+				patchStats.appendChild(el);
+			}
+		}
+
+		function renderTasks() {
+			tasksRoot.innerHTML = '';
+			if (!state.tasks.length) {
 				const empty = document.createElement('div');
 				empty.className = 'empty';
-				empty.textContent = ${noSessionsText};
-				sessionsRoot.appendChild(empty);
+				empty.textContent = state.labels.noTasks;
+				tasksRoot.appendChild(empty);
 				return;
 			}
 
-			for (const session of sessions) {
+			for (const task of state.tasks) {
+				const card = document.createElement('section');
+				card.className = 'task';
+
+				const top = document.createElement('div');
+				top.className = 'task-top';
+				const left = document.createElement('div');
+				const name = document.createElement('div');
+				name.className = 'task-name';
+				name.textContent = task.title;
+				const badges = document.createElement('div');
+				badges.className = 'badges';
+				const health = document.createElement('span');
+				health.className = 'health ' + task.health;
+				health.textContent = task.healthLabel;
+				badges.appendChild(health);
+				const pendingBadge = document.createElement('span');
+				pendingBadge.className = 'badge';
+				pendingBadge.textContent = state.labels.patchPending + ': ' + task.patchSummary.pending;
+				badges.appendChild(pendingBadge);
+				const conflictBadge = document.createElement('span');
+				conflictBadge.className = 'badge';
+				conflictBadge.textContent = state.labels.patchConflict + ': ' + task.patchSummary.conflict;
+				badges.appendChild(conflictBadge);
+				left.appendChild(name);
+				left.appendChild(badges);
+
+				const taskActions = document.createElement('div');
+				taskActions.className = 'task-actions';
+				const openTask = document.createElement('button');
+				openTask.className = 'btn inline secondary';
+				openTask.type = 'button';
+				openTask.textContent = state.labels.openTask;
+				openTask.addEventListener('click', () => post({ type: 'openTask', taskId: task.id }));
+				const createSession = document.createElement('button');
+				createSession.className = 'btn inline';
+				createSession.type = 'button';
+				createSession.textContent = state.labels.createSession;
+				createSession.addEventListener('click', () => post({ type: 'createSession', taskId: task.id }));
+				taskActions.appendChild(openTask);
+				taskActions.appendChild(createSession);
+
+				top.appendChild(left);
+				top.appendChild(taskActions);
+
+				const metaGrid = document.createElement('div');
+				metaGrid.className = 'meta-grid';
+				const branch = document.createElement('div');
+				branch.textContent = state.labels.branch + ': ' + task.branch;
+				const files = document.createElement('div');
+				files.textContent = state.labels.changedFiles + ': ' + task.changedFiles;
+				const worktree = document.createElement('div');
+				worktree.textContent = state.labels.worktree + ': ' + task.worktreePath;
+				metaGrid.appendChild(branch);
+				metaGrid.appendChild(files);
+				metaGrid.appendChild(worktree);
+
+				const sessionsTitle = document.createElement('div');
+				sessionsTitle.className = 'session-meta';
+				sessionsTitle.textContent = state.labels.sessions;
+
+				const sessionsRoot = document.createElement('div');
+				sessionsRoot.className = 'sessions';
+				if (!task.sessions.length) {
+					const emptySession = document.createElement('div');
+					emptySession.className = 'empty';
+					emptySession.textContent = state.labels.noSessions;
+					sessionsRoot.appendChild(emptySession);
+				}
+
+				for (const session of task.sessions) {
 				const card = document.createElement('div');
 				card.className = 'session';
-				card.dataset.sessionId = session.id;
-				card.addEventListener('click', event => {
-					const target = event.target;
-					if (target instanceof HTMLElement && (target.closest('.quick') || target.closest('.send'))) {
-						return;
-					}
-					vscode.postMessage({ type: 'openSession', sessionId: session.id });
-				});
-
 				const header = document.createElement('div');
-				header.className = 'header';
+				header.className = 'session-header';
 				const title = document.createElement('div');
-				title.className = 'title';
+				title.className = 'session-title';
 				title.textContent = session.name;
 				const status = document.createElement('div');
-				status.className = 'meta';
-				status.textContent = session.running ? ${runningText} : session.statusLabel;
+				status.className = 'session-meta';
+				status.textContent = session.agent + ' · ' + (session.running ? state.labels.running : (session.status || state.labels.idle));
 				header.appendChild(title);
 				header.appendChild(status);
 
-				const meta = document.createElement('div');
-				meta.className = 'meta';
-				meta.textContent = session.taskTitle + ' · ' + session.agent;
-
 				const row = document.createElement('div');
-				row.className = 'row';
+				row.className = 'reply-row';
 				const input = document.createElement('input');
 				input.className = 'quick';
-				input.placeholder = ${quickReplyPlaceholder};
+				input.placeholder = state.labels.quickReplyPlaceholder;
 				input.addEventListener('keydown', event => {
 					if (event.key !== 'Enter') {
 						return;
@@ -1726,50 +2043,85 @@ function renderSessionsWebviewHtml(webview: Webview): string {
 					if (!text) {
 						return;
 					}
-					vscode.postMessage({ type: 'sendQuickReply', sessionId: session.id, text });
+					post({ type: 'quickReply', sessionId: session.id, text });
 					input.value = '';
 				});
 				const send = document.createElement('button');
-				send.className = 'btn send';
+				send.className = 'btn inline';
 				send.type = 'button';
-				send.textContent = ${sendLabel};
+				send.textContent = state.labels.send;
 				send.addEventListener('click', () => {
 					const text = input.value.trim();
 					if (!text) {
 						return;
 					}
-					vscode.postMessage({ type: 'sendQuickReply', sessionId: session.id, text });
+					post({ type: 'quickReply', sessionId: session.id, text });
 					input.value = '';
 				});
 				const open = document.createElement('button');
-				open.className = 'btn';
+				open.className = 'btn inline secondary';
 				open.type = 'button';
-				open.textContent = ${openLabel};
+				open.textContent = state.labels.openSession;
 				open.addEventListener('click', () => {
-					vscode.postMessage({ type: 'openSession', sessionId: session.id });
+					post({ type: 'openSession', sessionId: session.id });
 				});
 				row.appendChild(input);
 				row.appendChild(send);
 				row.appendChild(open);
 
 				card.appendChild(header);
-				card.appendChild(meta);
 				card.appendChild(row);
 				sessionsRoot.appendChild(card);
+				}
+
+				card.appendChild(top);
+				card.appendChild(metaGrid);
+				card.appendChild(sessionsTitle);
+				card.appendChild(sessionsRoot);
+				tasksRoot.appendChild(card);
 			}
 		}
 
-		window.addEventListener('message', event => {
-			const message = event.data;
-			if (!message || message.type !== 'sessions' || !Array.isArray(message.sessions)) {
-				return;
-			}
-			sessions = message.sessions;
-			render();
-		});
+		setHeader();
+		renderTasks();
 	</script>
 </body>
 </html>`;
+}
+
+function summarizePatchStates(patchStates: WuuPatchState[]): WuuPatchSummary {
+	return patchStates.reduce<WuuPatchSummary>((summary, state) => {
+		switch (state.patch.status) {
+			case 'pending':
+				summary.pending += 1;
+				break;
+			case 'conflict':
+				summary.conflict += 1;
+				break;
+			case 'applied':
+				summary.applied += 1;
+				break;
+			case 'unsupported':
+				summary.unsupported += 1;
+				break;
+		}
+		return summary;
+	}, emptyPatchSummary());
+}
+
+function taskHealthLabel(health: TaskHealth): string {
+	switch (health) {
+		case 'ready':
+			return l10n.t('ready');
+		case 'missing':
+			return l10n.t('missing');
+		case 'error':
+			return l10n.t('error');
+	}
+}
+
+function toWebviewJson(value: unknown): string {
+	return JSON.stringify(value).replace(/</g, '\\u003c');
 }
 
 function createNonce(): string {
