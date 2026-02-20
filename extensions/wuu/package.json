@@ -56,7 +56,7 @@
       ],
       "secondarySidebar": [
         {
-          "id": "wuu.secondary",
+          "id": "wuu_secondary",
           "title": "%viewContainer.wuu.secondary.title%",
           "icon": "media/wuu.svg"
         }
@@ -73,7 +73,7 @@
           "name": "%view.patches.name%"
         }
       ],
-      "wuu.secondary": [
+      "wuu_secondary": [
         {
           "type": "webview",
           "id": "wuu.sessions",
