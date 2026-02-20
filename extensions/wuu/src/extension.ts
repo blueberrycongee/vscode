@@ -7,6 +7,7 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 import {
 	commands,
+	Event,
 	EventEmitter,
 	ExtensionContext,
 	l10n,
@@ -17,13 +18,16 @@ import {
 	Uri,
 	window,
 	workspace,
-	type Event,
 	WorkspaceFolder,
 } from 'vscode';
 import { countChangedFiles, pathExists, resolveRepositoryRoot, runGit } from './git';
 import { defaultBranchName, toSlug } from './naming';
+import { WuuPtyInfo, WuuPtyManager } from './pty';
+import { WuuSessionStatusInfo, WuuSessionStatusStore } from './sessionStatus';
 
 const TASKS_STORAGE_KEY = 'wuu.tasks';
+const SESSIONS_STORAGE_KEY = 'wuu.sessions';
+const SESSION_STATUSES_STORAGE_KEY = 'wuu.sessionStatuses';
 
 interface WuuTaskRecord {
 	id: string;
@@ -31,6 +35,15 @@ interface WuuTaskRecord {
 	repoRoot: string;
 	branch: string;
 	worktreePath: string;
+	createdAt: string;
+}
+
+interface WuuSessionRecord {
+	id: string;
+	taskId: string;
+	name: string;
+	agent: string;
+	commandLine: string;
 	createdAt: string;
 }
 
@@ -43,18 +56,26 @@ interface WuuTaskState {
 	error?: string;
 }
 
+interface WuuSessionState {
+	session: WuuSessionRecord;
+	task: WuuTaskRecord | undefined;
+	status: WuuSessionStatusInfo;
+	running: boolean;
+	pty?: WuuPtyInfo;
+}
+
+type WuuTreeItem = WuuTaskItem | WuuSessionItem;
+
 class WuuTaskItem extends TreeItem {
-	constructor(public readonly state: WuuTaskState) {
-		super(state.task.title, TreeItemCollapsibleState.None);
+	constructor(
+		public readonly state: WuuTaskState,
+		public readonly sessionCount: number,
+	) {
+		super(state.task.title, sessionCount > 0 ? TreeItemCollapsibleState.Expanded : TreeItemCollapsibleState.None);
 		this.contextValue = 'wuuTask';
-		this.description = l10n.t('{0} · {1} files', state.task.branch, state.changedFiles);
-		this.tooltip = toTooltip(state);
+		this.description = l10n.t('{0} · {1} files · {2} sessions', state.task.branch, state.changedFiles, sessionCount);
+		this.tooltip = toTaskTooltip(state, sessionCount);
 		this.resourceUri = Uri.file(state.task.worktreePath);
-		this.command = {
-			command: 'wuu.openTask',
-			title: l10n.t('Open Worktree'),
-			arguments: [this],
-		};
 
 		if (state.health === 'error') {
 			this.iconPath = new ThemeIcon('error');
@@ -66,30 +87,83 @@ class WuuTaskItem extends TreeItem {
 	}
 }
 
-class WuuTaskTreeProvider implements TreeDataProvider<WuuTaskItem> {
-	private readonly onDidChangeTreeDataEmitter = new EventEmitter<WuuTaskItem | null>();
-	readonly onDidChangeTreeData: Event<WuuTaskItem | null> = this.onDidChangeTreeDataEmitter.event;
-	private tasks: WuuTaskState[] = [];
+class WuuSessionItem extends TreeItem {
+	constructor(public readonly state: WuuSessionState) {
+		super(state.session.name, TreeItemCollapsibleState.None);
+		this.contextValue = toSessionContextValue(state);
+		this.description = toSessionDescription(state);
+		this.tooltip = toSessionTooltip(state);
+		this.command = {
+			command: 'wuu.openSessionTerminal',
+			title: l10n.t('Open Session Terminal'),
+			arguments: [this],
+		};
 
-	setTasks(tasks: WuuTaskState[]): void {
-		this.tasks = tasks;
-		this.onDidChangeTreeDataEmitter.fire(null);
-	}
-
-	refresh(): void {
-		this.onDidChangeTreeDataEmitter.fire(null);
-	}
-
-	getTreeItem(element: WuuTaskItem): TreeItem {
-		return element;
-	}
-
-	getChildren(): WuuTaskItem[] {
-		return this.tasks.map(task => new WuuTaskItem(task));
+		if (state.status.type === 'retry') {
+			this.iconPath = new ThemeIcon('warning');
+		} else if (state.running) {
+			this.iconPath = new ThemeIcon('terminal');
+		} else {
+			this.iconPath = new ThemeIcon('debug-pause');
+		}
 	}
 }
 
-class WuuTaskStore {
+class WuuTreeProvider implements TreeDataProvider<WuuTreeItem> {
+	private readonly onDidChangeTreeDataEmitter = new EventEmitter<WuuTreeItem | null>();
+	readonly onDidChangeTreeData: Event<WuuTreeItem | null> = this.onDidChangeTreeDataEmitter.event;
+	private taskStates: WuuTaskState[] = [];
+	private sessionsByTask = new Map<string, WuuSessionState[]>();
+
+	setData(taskStates: WuuTaskState[], sessionStates: WuuSessionState[]): void {
+		this.taskStates = taskStates;
+		const sessionsByTask = new Map<string, WuuSessionState[]>();
+		for (const session of sessionStates) {
+			const list = sessionsByTask.get(session.session.taskId) ?? [];
+			list.push(session);
+			sessionsByTask.set(session.session.taskId, list);
+		}
+
+		this.sessionsByTask = sessionsByTask;
+		this.onDidChangeTreeDataEmitter.fire(null);
+	}
+
+	getTreeItem(element: WuuTreeItem): TreeItem {
+		return element;
+	}
+
+	getParent(element: WuuTreeItem): WuuTreeItem | null {
+		if (element instanceof WuuTaskItem) {
+			return null;
+		}
+
+		const parentTask = this.taskStates.find(task => task.task.id === element.state.session.taskId);
+		if (!parentTask) {
+			return null;
+		}
+
+		const sessions = this.sessionsByTask.get(parentTask.task.id) ?? [];
+		return new WuuTaskItem(parentTask, sessions.length);
+	}
+
+	getChildren(element?: WuuTreeItem): WuuTreeItem[] {
+		if (!element) {
+			return this.taskStates.map(task => new WuuTaskItem(task, (this.sessionsByTask.get(task.task.id) ?? []).length));
+		}
+
+		if (element instanceof WuuTaskItem) {
+			const sessions = this.sessionsByTask.get(element.state.task.id) ?? [];
+			return sessions
+				.slice()
+				.sort((a, b) => a.session.createdAt.localeCompare(b.session.createdAt))
+				.map(session => new WuuSessionItem(session));
+		}
+
+		return [];
+	}
+}
+
+class WuuStore {
 	constructor(private readonly context: ExtensionContext) { }
 
 	getTasks(): WuuTaskRecord[] {
@@ -107,26 +181,58 @@ class WuuTaskStore {
 	}
 
 	async removeTask(taskId: string): Promise<void> {
-		const next = this.getTasks().filter(task => task.id !== taskId);
-		await this.saveTasks(next);
+		await this.saveTasks(this.getTasks().filter(task => task.id !== taskId));
+	}
+
+	getSessions(): WuuSessionRecord[] {
+		return this.context.workspaceState.get<WuuSessionRecord[]>(SESSIONS_STORAGE_KEY, []);
+	}
+
+	async saveSessions(sessions: WuuSessionRecord[]): Promise<void> {
+		await this.context.workspaceState.update(SESSIONS_STORAGE_KEY, sessions);
+	}
+
+	async addSession(session: WuuSessionRecord): Promise<void> {
+		const sessions = this.getSessions();
+		sessions.push(session);
+		await this.saveSessions(sessions);
+	}
+
+	async removeSession(sessionId: string): Promise<void> {
+		await this.saveSessions(this.getSessions().filter(session => session.id !== sessionId));
+	}
+
+	async removeSessionsForTask(taskId: string): Promise<void> {
+		await this.saveSessions(this.getSessions().filter(session => session.taskId !== taskId));
+	}
+
+	getSessionStatuses(): Record<string, WuuSessionStatusInfo> {
+		return this.context.workspaceState.get<Record<string, WuuSessionStatusInfo>>(SESSION_STATUSES_STORAGE_KEY, {});
+	}
+
+	async saveSessionStatuses(statuses: Record<string, WuuSessionStatusInfo>): Promise<void> {
+		await this.context.workspaceState.update(SESSION_STATUSES_STORAGE_KEY, statuses);
 	}
 }
 
 export function activate(context: ExtensionContext): void {
-	const store = new WuuTaskStore(context);
-	const provider = new WuuTaskTreeProvider();
+	const store = new WuuStore(context);
+	const provider = new WuuTreeProvider();
+	const ptyManager = new WuuPtyManager();
+	const statusStore = new WuuSessionStatusStore(store.getSessionStatuses());
 
 	context.subscriptions.push(
+		ptyManager,
 		window.createTreeView('wuu.tasks', { treeDataProvider: provider }),
 		commands.registerCommand('wuu.createTask', async () => {
 			await createTask(store);
-			await refreshTasks(provider, store);
+			await refreshView(provider, store, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.refreshTasks', async () => {
-			await refreshTasks(provider, store);
+			await refreshView(provider, store, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openTask', async (item?: WuuTaskItem) => {
-			const selected = item?.state.task ?? await pickTaskItem(store);
+			const selected = item?.state.task ?? await pickTask(store);
 			if (!selected) {
 				return;
 			}
@@ -134,23 +240,87 @@ export function activate(context: ExtensionContext): void {
 			await commands.executeCommand('vscode.openFolder', Uri.file(selected.worktreePath), true);
 		}),
 		commands.registerCommand('wuu.removeTask', async (item?: WuuTaskItem) => {
-			const selected = item?.state.task ?? await pickTaskItem(store);
+			const selected = item?.state.task ?? await pickTask(store);
 			if (!selected) {
 				return;
 			}
 
-			await removeTask(selected, store);
-			await refreshTasks(provider, store);
+			await removeTask(selected, store, statusStore, ptyManager);
+			await refreshView(provider, store, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.createSession', async (item?: WuuTaskItem) => {
+			const selectedTask = item?.state.task ?? await pickTask(store);
+			if (!selectedTask) {
+				return;
+			}
+
+			await createSession(selectedTask, store, statusStore, ptyManager);
+			await refreshView(provider, store, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.startSession', async (item?: WuuSessionItem) => {
+			const selectedSession = item?.state.session ?? await pickSession(store);
+			if (!selectedSession) {
+				return;
+			}
+
+			await startSession(selectedSession, store, statusStore, ptyManager);
+			await refreshView(provider, store, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.stopSession', async (item?: WuuSessionItem) => {
+			const selectedSession = item?.state.session ?? await pickSession(store);
+			if (!selectedSession) {
+				return;
+			}
+
+			await stopSession(selectedSession, store, statusStore, ptyManager);
+			await refreshView(provider, store, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.openSessionTerminal', async (item?: WuuSessionItem) => {
+			const selectedSession = item?.state.session ?? await pickSession(store);
+			if (!selectedSession) {
+				return;
+			}
+
+			await openSessionTerminal(selectedSession, store, statusStore, ptyManager);
+			await refreshView(provider, store, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.removeSession', async (item?: WuuSessionItem) => {
+			const selectedSession = item?.state.session ?? await pickSession(store);
+			if (!selectedSession) {
+				return;
+			}
+
+			await removeSession(selectedSession, store, statusStore, ptyManager);
+			await refreshView(provider, store, statusStore, ptyManager);
+		}),
+		ptyManager.onDidExit(async event => {
+			await setSessionStatus(event.sessionId, { type: 'idle' }, statusStore, store);
+			await refreshView(provider, store, statusStore, ptyManager);
 		}),
 	);
 
-	void refreshTasks(provider, store);
+	void initializeView(provider, store, statusStore, ptyManager);
 }
 
 export function deactivate(): void {
 }
 
-async function createTask(store: WuuTaskStore): Promise<void> {
+async function initializeView(
+	provider: WuuTreeProvider,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
+	for (const [sessionId, status] of Object.entries(statusStore.list())) {
+		if (status.type === 'busy') {
+			statusStore.set(sessionId, { type: 'idle' });
+		}
+	}
+	await store.saveSessionStatuses(statusStore.list());
+	await refreshView(provider, store, statusStore, ptyManager);
+}
+
+async function createTask(store: WuuStore): Promise<void> {
 	const workspaceFolder = getPrimaryWorkspaceFolder();
 	if (!workspaceFolder) {
 		window.showErrorMessage(l10n.t('Open a workspace folder to create a Wuu task.'));
@@ -225,9 +395,187 @@ async function createTask(store: WuuTaskStore): Promise<void> {
 	}
 }
 
-async function refreshTasks(provider: WuuTaskTreeProvider, store: WuuTaskStore): Promise<void> {
+async function createSession(
+	task: WuuTaskRecord,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
+	const selectedAgent = await window.showQuickPick([
+		{ label: 'codex', description: 'OpenAI Codex', defaultCommand: 'codex' },
+		{ label: 'opencode', description: 'OpenCode CLI', defaultCommand: 'opencode' },
+		{ label: 'claude-code', description: 'Claude Code CLI', defaultCommand: 'claude' },
+		{ label: 'oh-my-opencode', description: 'oh-my-opencode orchestrator', defaultCommand: 'omo' },
+		{ label: 'custom', description: 'Custom agent command', defaultCommand: '' },
+	], {
+		title: l10n.t('Select agent for task "{0}"', task.title),
+		ignoreFocusOut: true,
+	});
+	if (!selectedAgent) {
+		return;
+	}
+
+	const taskSessions = store.getSessions().filter(session => session.taskId === task.id);
+	const defaultName = `${selectedAgent.label}-${taskSessions.length + 1}`;
+	const sessionName = await window.showInputBox({
+		title: l10n.t('Create Wuu Session'),
+		prompt: l10n.t('Session name'),
+		value: defaultName,
+		ignoreFocusOut: true,
+		validateInput: input => input.trim().length === 0 ? l10n.t('Session name is required.') : undefined,
+	});
+	if (!sessionName) {
+		return;
+	}
+
+	const commandLine = await window.showInputBox({
+		title: l10n.t('Create Wuu Session'),
+		prompt: l10n.t('Agent command line'),
+		value: selectedAgent.defaultCommand,
+		ignoreFocusOut: true,
+		validateInput: input => input.trim().length === 0 ? l10n.t('Command line is required.') : undefined,
+	});
+	if (!commandLine) {
+		return;
+	}
+
+	const session: WuuSessionRecord = {
+		id: createSessionId(),
+		taskId: task.id,
+		name: sessionName,
+		agent: selectedAgent.label,
+		commandLine,
+		createdAt: new Date().toISOString(),
+	};
+
+	await store.addSession(session);
+	await setSessionStatus(session.id, { type: 'idle' }, statusStore, store);
+
+	const startAction = l10n.t('Start Session');
+	const selection = await window.showInformationMessage(
+		l10n.t('Session "{0}" created for task "{1}".', session.name, task.title),
+		startAction,
+	);
+
+	if (selection === startAction) {
+		await startSession(session, store, statusStore, ptyManager);
+	}
+}
+
+async function startSession(
+	session: WuuSessionRecord,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
+	const task = store.getTasks().find(item => item.id === session.taskId);
+	if (!task) {
+		window.showErrorMessage(l10n.t('Task for this session no longer exists.'));
+		return;
+	}
+
+	if (!await pathExists(task.worktreePath)) {
+		window.showErrorMessage(l10n.t('Worktree path no longer exists: {0}', task.worktreePath));
+		return;
+	}
+
+	try {
+		ptyManager.start(
+			session.id,
+			`${session.name} (${session.agent})`,
+			session.commandLine,
+			task.worktreePath,
+		);
+		await setSessionStatus(session.id, { type: 'busy' }, statusStore, store);
+	} catch (error) {
+		const currentStatus = statusStore.get(session.id);
+		const attempt = currentStatus.type === 'retry' ? currentStatus.attempt + 1 : 1;
+		const retryStatus: WuuSessionStatusInfo = {
+			type: 'retry',
+			attempt,
+			message: asErrorMessage(error),
+			next: Date.now() + 15_000,
+		};
+		await setSessionStatus(session.id, retryStatus, statusStore, store);
+		window.showErrorMessage(l10n.t('Failed to start session: {0}', asErrorMessage(error)));
+	}
+}
+
+async function stopSession(
+	session: WuuSessionRecord,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
+	ptyManager.stop(session.id);
+	await setSessionStatus(session.id, { type: 'idle' }, statusStore, store);
+}
+
+async function openSessionTerminal(
+	session: WuuSessionRecord,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
+	if (ptyManager.reveal(session.id)) {
+		return;
+	}
+
+	const startAction = l10n.t('Start Session');
+	const selection = await window.showInformationMessage(
+		l10n.t('Session "{0}" is not running.', session.name),
+		startAction,
+	);
+
+	if (selection === startAction) {
+		await startSession(session, store, statusStore, ptyManager);
+	}
+}
+
+async function removeSession(
+	session: WuuSessionRecord,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
+	const removeLabel = l10n.t('Remove Session');
+	const picked = await window.showWarningMessage(
+		l10n.t('Remove session "{0}"?', session.name),
+		{ modal: true },
+		removeLabel,
+	);
+
+	if (picked !== removeLabel) {
+		return;
+	}
+
+	ptyManager.stop(session.id);
+	statusStore.remove(session.id);
+	await store.removeSession(session.id);
+	await store.saveSessionStatuses(statusStore.list());
+}
+
+async function refreshView(
+	provider: WuuTreeProvider,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
 	const taskStates = await Promise.all(store.getTasks().map(task => inspectTask(task)));
-	provider.setTasks(taskStates);
+	const taskMap = new Map(taskStates.map(taskState => [taskState.task.id, taskState.task]));
+	const sessionStates = store.getSessions().map(session => {
+		const running = ptyManager.isRunning(session.id);
+		const status = running ? { type: 'busy' } satisfies WuuSessionStatusInfo : statusStore.get(session.id);
+		return {
+			session,
+			task: taskMap.get(session.taskId),
+			status,
+			running,
+			pty: ptyManager.get(session.id),
+		} satisfies WuuSessionState;
+	});
+
+	provider.setData(taskStates, sessionStates);
 }
 
 async function inspectTask(task: WuuTaskRecord): Promise<WuuTaskState> {
@@ -257,7 +605,12 @@ async function inspectTask(task: WuuTaskRecord): Promise<WuuTaskState> {
 	}
 }
 
-async function removeTask(task: WuuTaskRecord, store: WuuTaskStore): Promise<void> {
+async function removeTask(
+	task: WuuTaskRecord,
+	store: WuuStore,
+	statusStore: WuuSessionStatusStore,
+	ptyManager: WuuPtyManager,
+): Promise<void> {
 	const removeMetadataLabel = l10n.t('Remove Metadata');
 	const removeWorktreeLabel = l10n.t('Remove Worktree');
 	const picked = await window.showWarningMessage(
@@ -280,10 +633,27 @@ async function removeTask(task: WuuTaskRecord, store: WuuTaskStore): Promise<voi
 		}
 	}
 
+	const sessions = store.getSessions().filter(session => session.taskId === task.id);
+	for (const session of sessions) {
+		ptyManager.stop(session.id);
+		statusStore.remove(session.id);
+	}
+	await store.saveSessionStatuses(statusStore.list());
+	await store.removeSessionsForTask(task.id);
 	await store.removeTask(task.id);
 }
 
-async function pickTaskItem(store: WuuTaskStore): Promise<WuuTaskRecord | undefined> {
+async function setSessionStatus(
+	sessionId: string,
+	status: WuuSessionStatusInfo,
+	statusStore: WuuSessionStatusStore,
+	store: WuuStore,
+): Promise<void> {
+	statusStore.set(sessionId, status);
+	await store.saveSessionStatuses(statusStore.list());
+}
+
+async function pickTask(store: WuuStore): Promise<WuuTaskRecord | undefined> {
 	const tasks = store.getTasks();
 	if (tasks.length === 0) {
 		window.showInformationMessage(l10n.t('No tasks available.'));
@@ -303,6 +673,27 @@ async function pickTaskItem(store: WuuTaskStore): Promise<WuuTaskRecord | undefi
 	return picked?.task;
 }
 
+async function pickSession(store: WuuStore): Promise<WuuSessionRecord | undefined> {
+	const sessions = store.getSessions();
+	if (sessions.length === 0) {
+		window.showInformationMessage(l10n.t('No sessions available.'));
+		return;
+	}
+
+	const taskMap = new Map(store.getTasks().map(task => [task.id, task]));
+	const picked = await window.showQuickPick(sessions.map(session => ({
+		label: session.name,
+		description: session.agent,
+		detail: taskMap.get(session.taskId)?.title ?? l10n.t('Missing task'),
+		session,
+	})), {
+		title: l10n.t('Select Wuu Session'),
+		ignoreFocusOut: true,
+	});
+
+	return picked?.session;
+}
+
 function getPrimaryWorkspaceFolder(): WorkspaceFolder | undefined {
 	return workspace.workspaceFolders?.[0];
 }
@@ -318,6 +709,10 @@ function createTaskId(): string {
 	return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function createSessionId(): string {
+	return `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function asErrorMessage(error: unknown): string {
 	if (error instanceof Error) {
 		return error.message;
@@ -326,12 +721,13 @@ function asErrorMessage(error: unknown): string {
 	return String(error);
 }
 
-function toTooltip(state: WuuTaskState): string {
+function toTaskTooltip(state: WuuTaskState, sessionCount: number): string {
 	const lines = [
 		`${l10n.t('Task')}: ${state.task.title}`,
 		`${l10n.t('Branch')}: ${state.task.branch}`,
 		`${l10n.t('Worktree')}: ${state.task.worktreePath}`,
 		`${l10n.t('Changed files')}: ${state.changedFiles}`,
+		`${l10n.t('Sessions')}: ${sessionCount}`,
 		`${l10n.t('Created')}: ${state.task.createdAt}`,
 	];
 
@@ -340,4 +736,54 @@ function toTooltip(state: WuuTaskState): string {
 	}
 
 	return lines.join('\n');
+}
+
+function toSessionContextValue(state: WuuSessionState): string {
+	if (state.status.type === 'retry') {
+		return 'wuuSessionRetry';
+	}
+	if (state.running) {
+		return 'wuuSessionRunning';
+	}
+	return 'wuuSessionIdle';
+}
+
+function toSessionDescription(state: WuuSessionState): string {
+	if (state.status.type === 'retry') {
+		return l10n.t('{0} · retry #{1}', state.session.agent, state.status.attempt);
+	}
+	if (state.running) {
+		return l10n.t('{0} · running', state.session.agent);
+	}
+
+	return l10n.t('{0} · idle', state.session.agent);
+}
+
+function toSessionTooltip(state: WuuSessionState): string {
+	const lines = [
+		`${l10n.t('Session')}: ${state.session.name}`,
+		`${l10n.t('Agent')}: ${state.session.agent}`,
+		`${l10n.t('Task')}: ${state.task?.title ?? l10n.t('Missing task')}`,
+		`${l10n.t('Command')}: ${state.session.commandLine}`,
+		`${l10n.t('Status')}: ${statusLabel(state.status)}`,
+		`${l10n.t('Created')}: ${state.session.createdAt}`,
+	];
+
+	if (state.pty?.pid !== undefined) {
+		lines.push(`${l10n.t('PID')}: ${state.pty.pid}`);
+	}
+
+	if (state.status.type === 'retry') {
+		lines.push(`${l10n.t('Retry message')}: ${state.status.message}`);
+		lines.push(`${l10n.t('Retry at')}: ${new Date(state.status.next).toISOString()}`);
+	}
+
+	return lines.join('\n');
+}
+
+function statusLabel(status: WuuSessionStatusInfo): string {
+	if (status.type === 'retry') {
+		return l10n.t('retry');
+	}
+	return status.type;
 }

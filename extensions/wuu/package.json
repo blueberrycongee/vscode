@@ -20,9 +20,14 @@
   "activationEvents": [
     "onView:wuu.tasks",
     "onCommand:wuu.createTask",
+    "onCommand:wuu.createSession",
     "onCommand:wuu.refreshTasks",
     "onCommand:wuu.openTask",
-    "onCommand:wuu.removeTask"
+    "onCommand:wuu.removeTask",
+    "onCommand:wuu.startSession",
+    "onCommand:wuu.stopSession",
+    "onCommand:wuu.openSessionTerminal",
+    "onCommand:wuu.removeSession"
   ],
   "main": "./out/extension",
   "scripts": {
@@ -75,6 +80,34 @@
         "command": "wuu.removeTask",
         "category": "%command.category%",
         "title": "%command.removeTask%"
+      },
+      {
+        "command": "wuu.createSession",
+        "category": "%command.category%",
+        "title": "%command.createSession%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "wuu.startSession",
+        "category": "%command.category%",
+        "title": "%command.startSession%",
+        "icon": "$(play)"
+      },
+      {
+        "command": "wuu.stopSession",
+        "category": "%command.category%",
+        "title": "%command.stopSession%",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "wuu.openSessionTerminal",
+        "category": "%command.category%",
+        "title": "%command.openSessionTerminal%"
+      },
+      {
+        "command": "wuu.removeSession",
+        "category": "%command.category%",
+        "title": "%command.removeSession%"
       }
     ],
     "menus": {
@@ -88,6 +121,11 @@
           "command": "wuu.refreshTasks",
           "when": "view == wuu.tasks",
           "group": "navigation@1"
+        },
+        {
+          "command": "wuu.createSession",
+          "when": "view == wuu.tasks",
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
@@ -100,6 +138,36 @@
           "command": "wuu.removeTask",
           "when": "view == wuu.tasks && viewItem == wuuTask",
           "group": "inline"
+        },
+        {
+          "command": "wuu.createSession",
+          "when": "view == wuu.tasks && viewItem == wuuTask",
+          "group": "navigation@1"
+        },
+        {
+          "command": "wuu.openSessionTerminal",
+          "when": "view == wuu.tasks && viewItem == wuuSessionRunning",
+          "group": "navigation"
+        },
+        {
+          "command": "wuu.stopSession",
+          "when": "view == wuu.tasks && viewItem == wuuSessionRunning",
+          "group": "inline"
+        },
+        {
+          "command": "wuu.startSession",
+          "when": "view == wuu.tasks && viewItem == wuuSessionIdle",
+          "group": "inline"
+        },
+        {
+          "command": "wuu.startSession",
+          "when": "view == wuu.tasks && viewItem == wuuSessionRetry",
+          "group": "inline"
+        },
+        {
+          "command": "wuu.removeSession",
+          "when": "view == wuu.tasks && (viewItem == wuuSessionRunning || viewItem == wuuSessionIdle || viewItem == wuuSessionRetry)",
+          "group": "navigation@9"
         }
       ]
     },

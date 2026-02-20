@@ -9,5 +9,10 @@
   "command.refreshTasks": "Refresh Tasks",
   "command.openTask": "Open Worktree",
   "command.removeTask": "Remove Task",
+  "command.createSession": "Create Session",
+  "command.startSession": "Start Session",
+  "command.stopSession": "Stop Session",
+  "command.openSessionTerminal": "Open Session Terminal",
+  "command.removeSession": "Remove Session",
   "config.worktreesRoot": "Root directory for created worktrees. Supports `${workspaceFolder}` and `${repoRoot}` variables."
 }
