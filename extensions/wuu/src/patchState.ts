@@ -77,6 +77,22 @@ export class WuuPatchStore {
 		return next;
 	}
 
+	async remove(repoRoot: string, patchId: string): Promise<boolean> {
+		const state = await this.readState(repoRoot);
+		const index = state.patches.findIndex(patch => patch.id === patchId);
+		if (index < 0) {
+			return false;
+		}
+
+		const [removed] = state.patches.splice(index, 1);
+		await this.writeState(repoRoot, state);
+		if (removed.patchPath) {
+			await fs.unlink(removed.patchPath).catch(() => undefined);
+		}
+
+		return true;
+	}
+
 	async removeForTask(repoRoot: string, taskId: string): Promise<void> {
 		const state = await this.readState(repoRoot);
 		const removedPatches = state.patches.filter(patch => patch.taskId === taskId);

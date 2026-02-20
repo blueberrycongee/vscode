@@ -6,6 +6,7 @@ Wuu adds a task panel for worktree-first development inside VS Code.
 
 - Create isolated git worktrees per task
 - List tasks in a dedicated **Wuu** activity bar view
+- Track exported patches in a dedicated **Patch Inbox** view
 - Attach multiple agent sessions to each task
 - Show branch and changed-file count per task
 - Track session status (`idle`, `busy`, `retry`) inspired by OpenCode session status flow
@@ -13,6 +14,7 @@ Wuu adds a task panel for worktree-first development inside VS Code.
 - Start and stop per-session terminals in each task worktree
 - Export patch files from task worktrees into `.wuu/patches/`
 - Preview and apply exported patches back to the primary workspace branch
+- Handle patch apply conflicts via inbox actions (`Apply` retry, `Mark Applied`, `Requeue`, `Remove`)
 - Remove task metadata/worktree and cascade remove attached sessions
 
 ## Commands
@@ -29,6 +31,10 @@ Wuu adds a task panel for worktree-first development inside VS Code.
 - `Wuu: Export Task Patch`
 - `Wuu: Preview Patch`
 - `Wuu: Apply Patch to Workspace`
+- `Wuu: Requeue Patch`
+- `Wuu: Mark Patch as Applied`
+- `Wuu: Remove Patch`
+- `Wuu: Focus Patch Inbox`
 
 ## Configuration
 
