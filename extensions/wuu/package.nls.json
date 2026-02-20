@@ -1,0 +1,13 @@
+{
+  "displayName": "Wuu",
+  "description": "Worktree-first task panel for parallel AI coding.",
+  "viewContainer.wuu.title": "Wuu",
+  "view.tasks.name": "Tasks",
+  "view.tasks.welcome": "No tasks yet. [Create Task](command:wuu.createTask)",
+  "command.category": "Wuu",
+  "command.createTask": "Create Task",
+  "command.refreshTasks": "Refresh Tasks",
+  "command.openTask": "Open Worktree",
+  "command.removeTask": "Remove Task",
+  "config.worktreesRoot": "Root directory for created worktrees. Supports `${workspaceFolder}` and `${repoRoot}` variables."
+}
