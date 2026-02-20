@@ -7,9 +7,9 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 import {
 	commands,
-	Event,
 	EventEmitter,
 	ExtensionContext,
+	extensions,
 	l10n,
 	ThemeIcon,
 	TreeDataProvider,
@@ -18,10 +18,12 @@ import {
 	Uri,
 	window,
 	workspace,
+	type Event,
 	WorkspaceFolder,
 } from 'vscode';
 import { countChangedFiles, pathExists, resolveRepositoryRoot, runGit } from './git';
 import { defaultBranchName, toSlug } from './naming';
+import { emptyPatchSummary, WuuPatchRecord, WuuPatchStatus, WuuPatchStore, WuuPatchSummary } from './patchState';
 import { WuuPtyInfo, WuuPtyManager } from './pty';
 import { WuuSessionStatusInfo, WuuSessionStatusStore } from './sessionStatus';
 
@@ -53,6 +55,7 @@ interface WuuTaskState {
 	task: WuuTaskRecord;
 	health: TaskHealth;
 	changedFiles: number;
+	patchSummary: WuuPatchSummary;
 	error?: string;
 }
 
@@ -64,6 +67,19 @@ interface WuuSessionState {
 	pty?: WuuPtyInfo;
 }
 
+interface GitRepositoryApi {
+	rootUri: Uri;
+	apply(patch: string, options?: { allowEmpty?: boolean; reverse?: boolean; threeWay?: boolean }): Promise<void>;
+}
+
+interface GitApi {
+	repositories: GitRepositoryApi[];
+}
+
+interface GitExtensionApi {
+	getAPI(version: 1): GitApi;
+}
+
 type WuuTreeItem = WuuTaskItem | WuuSessionItem;
 
 class WuuTaskItem extends TreeItem {
@@ -73,8 +89,8 @@ class WuuTaskItem extends TreeItem {
 	) {
 		super(state.task.title, sessionCount > 0 ? TreeItemCollapsibleState.Expanded : TreeItemCollapsibleState.None);
 		this.contextValue = 'wuuTask';
-		this.description = l10n.t('{0} · {1} files · {2} sessions', state.task.branch, state.changedFiles, sessionCount);
-		this.tooltip = toTaskTooltip(state, sessionCount);
+		this.description = l10n.t('{0} · {1} files · {2} sessions · {3} patches', state.task.branch, state.changedFiles, sessionCount, state.patchSummary.pending);
+		this.tooltip = toTaskTooltip(state, sessionCount, state.patchSummary);
 		this.resourceUri = Uri.file(state.task.worktreePath);
 		this.command = {
 			command: 'wuu.openTask',
@@ -85,6 +101,8 @@ class WuuTaskItem extends TreeItem {
 		if (state.health === 'error') {
 			this.iconPath = new ThemeIcon('error');
 		} else if (state.health === 'missing') {
+			this.iconPath = new ThemeIcon('warning');
+		} else if (state.patchSummary.conflict > 0) {
 			this.iconPath = new ThemeIcon('warning');
 		} else {
 			this.iconPath = new ThemeIcon('git-branch');
@@ -224,6 +242,7 @@ export function activate(context: ExtensionContext): void {
 	const store = new WuuStore(context);
 	const provider = new WuuTreeProvider();
 	const ptyManager = new WuuPtyManager();
+	const patchStore = new WuuPatchStore();
 	const statusStore = new WuuSessionStatusStore(store.getSessionStatuses());
 
 	context.subscriptions.push(
@@ -231,10 +250,10 @@ export function activate(context: ExtensionContext): void {
 		window.createTreeView('wuu.tasks', { treeDataProvider: provider }),
 		commands.registerCommand('wuu.createTask', async () => {
 			await createTask(store);
-			await refreshView(provider, store, statusStore, ptyManager);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.refreshTasks', async () => {
-			await refreshView(provider, store, statusStore, ptyManager);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openTask', async (item?: WuuTaskItem) => {
 			const selected = item?.state.task ?? await pickTask(store);
@@ -250,8 +269,8 @@ export function activate(context: ExtensionContext): void {
 				return;
 			}
 
-			await removeTask(selected, store, statusStore, ptyManager);
-			await refreshView(provider, store, statusStore, ptyManager);
+			await removeTask(selected, store, patchStore, statusStore, ptyManager);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.createSession', async (item?: WuuTaskItem) => {
 			const selectedTask = item?.state.task ?? await pickTask(store);
@@ -260,7 +279,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await createSession(selectedTask, store, statusStore, ptyManager);
-			await refreshView(provider, store, statusStore, ptyManager);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.startSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -269,7 +288,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await startSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(provider, store, statusStore, ptyManager);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.stopSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -278,7 +297,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await stopSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(provider, store, statusStore, ptyManager);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.openSessionTerminal', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -287,7 +306,7 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await openSessionTerminal(selectedSession, store, statusStore, ptyManager);
-			await refreshView(provider, store, statusStore, ptyManager);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
 		}),
 		commands.registerCommand('wuu.removeSession', async (item?: WuuSessionItem) => {
 			const selectedSession = item?.state.session ?? await pickSession(store);
@@ -296,15 +315,41 @@ export function activate(context: ExtensionContext): void {
 			}
 
 			await removeSession(selectedSession, store, statusStore, ptyManager);
-			await refreshView(provider, store, statusStore, ptyManager);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.exportTaskPatch', async (item?: WuuTaskItem) => {
+			const task = item?.state.task ?? await pickTask(store);
+			if (!task) {
+				return;
+			}
+
+			await exportTaskPatch(task, patchStore);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
+		}),
+		commands.registerCommand('wuu.previewPatch', async (item?: WuuTaskItem) => {
+			const patch = await pickPatch(store, patchStore, { taskId: item?.state.task.id });
+			if (!patch) {
+				return;
+			}
+
+			await previewPatch(patch);
+		}),
+		commands.registerCommand('wuu.applyPatch', async (item?: WuuTaskItem) => {
+			const patch = await pickPatch(store, patchStore, { taskId: item?.state.task.id, statuses: ['pending', 'conflict'] });
+			if (!patch) {
+				return;
+			}
+
+			await applyPatchToWorkspace(patch, patchStore);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
 		}),
 		ptyManager.onDidExit(async event => {
 			await setSessionStatus(event.sessionId, { type: 'idle' }, statusStore, store);
-			await refreshView(provider, store, statusStore, ptyManager);
+			await refreshView(provider, store, patchStore, statusStore, ptyManager);
 		}),
 	);
 
-	void initializeView(provider, store, statusStore, ptyManager);
+	void initializeView(provider, store, patchStore, statusStore, ptyManager);
 }
 
 export function deactivate(): void {
@@ -313,6 +358,7 @@ export function deactivate(): void {
 async function initializeView(
 	provider: WuuTreeProvider,
 	store: WuuStore,
+	patchStore: WuuPatchStore,
 	statusStore: WuuSessionStatusStore,
 	ptyManager: WuuPtyManager,
 ): Promise<void> {
@@ -322,7 +368,7 @@ async function initializeView(
 		}
 	}
 	await store.saveSessionStatuses(statusStore.list());
-	await refreshView(provider, store, statusStore, ptyManager);
+	await refreshView(provider, store, patchStore, statusStore, ptyManager);
 }
 
 async function createTask(store: WuuStore): Promise<void> {
@@ -560,13 +606,250 @@ async function removeSession(
 	await store.saveSessionStatuses(statusStore.list());
 }
 
+async function exportTaskPatch(task: WuuTaskRecord, patchStore: WuuPatchStore): Promise<void> {
+	if (!await pathExists(task.worktreePath)) {
+		window.showErrorMessage(l10n.t('Worktree path no longer exists: {0}', task.worktreePath));
+		return;
+	}
+	const changedFiles = await countChangedFiles(task.worktreePath);
+	if (changedFiles === 0) {
+		window.showInformationMessage(l10n.t('No changes were found in this task worktree.'));
+		return;
+	}
+
+	const trackedNumstat = await runGit(['diff', '--numstat', '--no-renames', 'HEAD', '--', '.'], task.worktreePath);
+	const trackedTextFiles = new Set<string>();
+	const unsupportedFiles = new Set<string>();
+
+	for (const line of trackedNumstat.stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean)) {
+		const parsed = parseNumstatLine(line);
+		if (!parsed) {
+			continue;
+		}
+
+		if (parsed.additions === '-' || parsed.deletions === '-') {
+			unsupportedFiles.add(parsed.filePath);
+		} else {
+			trackedTextFiles.add(parsed.filePath);
+		}
+	}
+
+	const untrackedFiles = (await runGit(['ls-files', '--others', '--exclude-standard', '--', '.'], task.worktreePath)).stdout
+		.split(/\r?\n/)
+		.map(line => line.trim())
+		.filter(Boolean);
+	const untrackedTextFiles: string[] = [];
+
+	for (const relativePath of untrackedFiles) {
+		const fullPath = path.join(task.worktreePath, relativePath);
+		if (await isLikelyBinaryFile(fullPath)) {
+			unsupportedFiles.add(relativePath);
+		} else {
+			untrackedTextFiles.push(relativePath);
+		}
+	}
+
+	const patchParts: string[] = [];
+	if (trackedTextFiles.size > 0) {
+		const trackedPatch = await runGit(
+			['diff', '--binary', '--no-ext-diff', '--no-renames', 'HEAD', '--', ...trackedTextFiles],
+			task.worktreePath,
+		);
+		if (trackedPatch.stdout.trim()) {
+			patchParts.push(trackedPatch.stdout.trimEnd());
+		}
+	}
+
+	for (const relativePath of untrackedTextFiles) {
+		try {
+			const diff = await runGit(
+				['diff', '--no-ext-diff', '--no-index', '--', '/dev/null', relativePath],
+				task.worktreePath,
+				{ allowedExitCodes: [0, 1] },
+			);
+			if (diff.stdout.trim()) {
+				patchParts.push(diff.stdout.trimEnd());
+			}
+		} catch {
+			unsupportedFiles.add(relativePath);
+		}
+	}
+
+	const patchText = patchParts.join('\n\n');
+	if (!patchText && unsupportedFiles.size === 0) {
+		window.showInformationMessage(l10n.t('No exportable patch was found for this task.'));
+		return;
+	}
+
+	let status: WuuPatchStatus = 'pending';
+	let patchPath = '';
+	if (!patchText) {
+		status = 'unsupported';
+	} else {
+		const patchDirectory = await patchStore.ensurePatchDirectory(task.repoRoot, task.id);
+		const patchFilename = `${Date.now()}-${toSlug(task.title)}.patch`;
+		patchPath = path.join(patchDirectory, patchFilename);
+		await fs.writeFile(patchPath, patchText + '\n', 'utf8');
+	}
+
+	const patchRecord: WuuPatchRecord = {
+		id: createPatchId(),
+		taskId: task.id,
+		repoRoot: task.repoRoot,
+		sourceBranch: task.branch,
+		patchPath,
+		status,
+		createdAt: new Date().toISOString(),
+		changedFiles,
+		unsupportedFiles: [...unsupportedFiles].sort(),
+	};
+
+	await patchStore.add(task.repoRoot, patchRecord);
+
+	if (status === 'unsupported') {
+		window.showWarningMessage(l10n.t('Patch export skipped unsupported files. No patch was generated.'));
+		return;
+	}
+
+	const previewAction = l10n.t('Preview Patch');
+	const applyAction = l10n.t('Apply Patch');
+	const message = unsupportedFiles.size > 0
+		? l10n.t('Patch exported with {0} unsupported file(s).', unsupportedFiles.size)
+		: l10n.t('Patch exported successfully.');
+	const selection = await window.showInformationMessage(message, previewAction, applyAction);
+	if (selection === previewAction) {
+		await previewPatch(patchRecord);
+	} else if (selection === applyAction) {
+		await applyPatchToWorkspace(patchRecord, patchStore);
+	}
+}
+
+async function previewPatch(patch: WuuPatchRecord): Promise<void> {
+	if (!patch.patchPath) {
+		window.showInformationMessage(l10n.t('This patch has no text payload to preview.'));
+		return;
+	}
+	if (!await pathExists(patch.patchPath)) {
+		window.showErrorMessage(l10n.t('Patch file no longer exists: {0}', patch.patchPath));
+		return;
+	}
+
+	const document = await workspace.openTextDocument(Uri.file(patch.patchPath));
+	await window.showTextDocument(document, { preview: false, preserveFocus: false });
+}
+
+async function applyPatchToWorkspace(patch: WuuPatchRecord, patchStore: WuuPatchStore): Promise<void> {
+	if (!patch.patchPath) {
+		window.showErrorMessage(l10n.t('This patch cannot be applied because no patch file was generated.'));
+		return;
+	}
+	if (!await pathExists(patch.patchPath)) {
+		window.showErrorMessage(l10n.t('Patch file no longer exists: {0}', patch.patchPath));
+		return;
+	}
+
+	const workspaceFolder = getPrimaryWorkspaceFolder();
+	if (!workspaceFolder) {
+		window.showErrorMessage(l10n.t('Open the target workspace before applying a patch.'));
+		return;
+	}
+
+	let currentRepoRoot: string;
+	try {
+		currentRepoRoot = await resolveRepositoryRoot(workspaceFolder.uri.fsPath);
+	} catch (error) {
+		window.showErrorMessage(l10n.t('The current workspace is not a git repository: {0}', asErrorMessage(error)));
+		return;
+	}
+
+	if (currentRepoRoot !== patch.repoRoot) {
+		window.showErrorMessage(l10n.t('Patch repository mismatch. Open the primary repository workspace to apply this patch.'));
+		return;
+	}
+
+	try {
+		const gitRepository = await getGitRepositoryApi(currentRepoRoot);
+		if (gitRepository) {
+			await gitRepository.apply(patch.patchPath, { threeWay: true });
+		} else {
+			await runGit(['apply', '--3way', patch.patchPath], currentRepoRoot);
+		}
+
+		const appliedBranch = await getCurrentBranch(currentRepoRoot);
+		await patchStore.update(patch.repoRoot, patch.id, current => ({
+			...current,
+			status: 'applied',
+			appliedAt: new Date().toISOString(),
+			appliedBranch,
+			error: undefined,
+		}));
+		window.showInformationMessage(l10n.t('Patch applied successfully on branch {0}.', appliedBranch));
+	} catch (error) {
+		const message = asErrorMessage(error);
+		await patchStore.update(patch.repoRoot, patch.id, current => ({
+			...current,
+			status: 'conflict',
+			error: message,
+		}));
+		window.showErrorMessage(l10n.t('Patch apply failed: {0}', message));
+	}
+}
+
+async function pickPatch(
+	store: WuuStore,
+	patchStore: WuuPatchStore,
+	options?: { taskId?: string; statuses?: WuuPatchStatus[] },
+): Promise<WuuPatchRecord | undefined> {
+	const tasks = store.getTasks();
+	if (tasks.length === 0) {
+		window.showInformationMessage(l10n.t('No tasks available.'));
+		return;
+	}
+
+	const taskById = new Map(tasks.map(task => [task.id, task]));
+	const patches = (await listPatchesForKnownTasks(store, patchStore))
+		.filter(patch => !options?.taskId || patch.taskId === options.taskId)
+		.filter(patch => !options?.statuses || options.statuses.includes(patch.status));
+
+	if (patches.length === 0) {
+		window.showInformationMessage(l10n.t('No patches available for this selection.'));
+		return;
+	}
+
+	const picked = await window.showQuickPick(patches.map(patch => ({
+		label: patchLabel(patch),
+		description: taskById.get(patch.taskId)?.title ?? l10n.t('Missing task'),
+		detail: patchDetails(patch),
+		patch,
+	})), {
+		title: l10n.t('Select Wuu Patch'),
+		ignoreFocusOut: true,
+	});
+
+	return picked?.patch;
+}
+
+async function listPatchesForKnownTasks(store: WuuStore, patchStore: WuuPatchStore): Promise<WuuPatchRecord[]> {
+	const tasks = store.getTasks();
+	const taskIds = new Set(tasks.map(task => task.id));
+	const repoRoots = [...new Set(tasks.map(task => task.repoRoot))];
+	const patchLists = await Promise.all(repoRoots.map(repoRoot => patchStore.list(repoRoot)));
+	return patchLists
+		.flat()
+		.filter(patch => taskIds.has(patch.taskId))
+		.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
 async function refreshView(
 	provider: WuuTreeProvider,
 	store: WuuStore,
+	patchStore: WuuPatchStore,
 	statusStore: WuuSessionStatusStore,
 	ptyManager: WuuPtyManager,
 ): Promise<void> {
-	const taskStates = await Promise.all(store.getTasks().map(task => inspectTask(task)));
+	const tasks = store.getTasks();
+	const patchSummaryByTask = await patchStore.summarizeByTask(tasks.map(task => task.repoRoot));
+	const taskStates = await Promise.all(tasks.map(task => inspectTask(task, patchSummaryByTask.get(task.id) ?? emptyPatchSummary())));
 	const taskMap = new Map(taskStates.map(taskState => [taskState.task.id, taskState.task]));
 	const sessionStates = store.getSessions().map(session => {
 		const running = ptyManager.isRunning(session.id);
@@ -583,12 +866,13 @@ async function refreshView(
 	provider.setData(taskStates, sessionStates);
 }
 
-async function inspectTask(task: WuuTaskRecord): Promise<WuuTaskState> {
+async function inspectTask(task: WuuTaskRecord, patchSummary: WuuPatchSummary): Promise<WuuTaskState> {
 	if (!await pathExists(task.worktreePath)) {
 		return {
 			task,
 			health: 'missing',
 			changedFiles: 0,
+			patchSummary,
 			error: l10n.t('Worktree directory not found'),
 		};
 	}
@@ -599,12 +883,14 @@ async function inspectTask(task: WuuTaskRecord): Promise<WuuTaskState> {
 			task,
 			health: 'ready',
 			changedFiles,
+			patchSummary,
 		};
 	} catch (error) {
 		return {
 			task,
 			health: 'error',
 			changedFiles: 0,
+			patchSummary,
 			error: asErrorMessage(error),
 		};
 	}
@@ -613,6 +899,7 @@ async function inspectTask(task: WuuTaskRecord): Promise<WuuTaskState> {
 async function removeTask(
 	task: WuuTaskRecord,
 	store: WuuStore,
+	patchStore: WuuPatchStore,
 	statusStore: WuuSessionStatusStore,
 	ptyManager: WuuPtyManager,
 ): Promise<void> {
@@ -645,6 +932,7 @@ async function removeTask(
 	}
 	await store.saveSessionStatuses(statusStore.list());
 	await store.removeSessionsForTask(task.id);
+	await patchStore.removeForTask(task.repoRoot, task.id);
 	await store.removeTask(task.id);
 }
 
@@ -718,6 +1006,66 @@ function createSessionId(): string {
 	return `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function createPatchId(): string {
+	return `patch-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function patchLabel(patch: WuuPatchRecord): string {
+	return `${patch.status.toUpperCase()} · ${new Date(patch.createdAt).toLocaleString()}`;
+}
+
+function patchDetails(patch: WuuPatchRecord): string {
+	const unsupported = patch.unsupportedFiles.length > 0 ? ` · unsupported ${patch.unsupportedFiles.length}` : '';
+	const suffix = patch.patchPath ? patch.patchPath : l10n.t('No patch file');
+	return `${patch.changedFiles} files${unsupported} · ${suffix}`;
+}
+
+function parseNumstatLine(line: string): { additions: string; deletions: string; filePath: string } | undefined {
+	const parts = line.split('\t');
+	if (parts.length < 3) {
+		return undefined;
+	}
+
+	const [additions, deletions, ...fileParts] = parts;
+	return {
+		additions,
+		deletions,
+		filePath: fileParts.join('\t'),
+	};
+}
+
+async function isLikelyBinaryFile(filePath: string): Promise<boolean> {
+	const handle = await fs.open(filePath, 'r');
+	try {
+		const probe = Buffer.alloc(8192);
+		const { bytesRead } = await handle.read(probe, 0, probe.length, 0);
+		for (let i = 0; i < bytesRead; i++) {
+			if (probe[i] === 0) {
+				return true;
+			}
+		}
+		return false;
+	} finally {
+		await handle.close();
+	}
+}
+
+async function getCurrentBranch(repoRoot: string): Promise<string> {
+	const { stdout } = await runGit(['branch', '--show-current'], repoRoot);
+	return stdout.trim() || 'HEAD';
+}
+
+async function getGitRepositoryApi(repoRoot: string): Promise<GitRepositoryApi | undefined> {
+	const extension = extensions.getExtension<GitExtensionApi>('vscode.git');
+	if (!extension) {
+		return undefined;
+	}
+
+	const git = extension.isActive ? extension.exports : await extension.activate();
+	const api = git.getAPI(1);
+	return api.repositories.find(repository => repository.rootUri.fsPath === repoRoot);
+}
+
 function asErrorMessage(error: unknown): string {
 	if (error instanceof Error) {
 		return error.message;
@@ -726,13 +1074,14 @@ function asErrorMessage(error: unknown): string {
 	return String(error);
 }
 
-function toTaskTooltip(state: WuuTaskState, sessionCount: number): string {
+function toTaskTooltip(state: WuuTaskState, sessionCount: number, patchSummary: WuuPatchSummary): string {
 	const lines = [
 		`${l10n.t('Task')}: ${state.task.title}`,
 		`${l10n.t('Branch')}: ${state.task.branch}`,
 		`${l10n.t('Worktree')}: ${state.task.worktreePath}`,
 		`${l10n.t('Changed files')}: ${state.changedFiles}`,
 		`${l10n.t('Sessions')}: ${sessionCount}`,
+		`${l10n.t('Patches (pending/applied/conflict/unsupported)')}: ${patchSummary.pending}/${patchSummary.applied}/${patchSummary.conflict}/${patchSummary.unsupported}`,
 		`${l10n.t('Created')}: ${state.task.createdAt}`,
 	];
 

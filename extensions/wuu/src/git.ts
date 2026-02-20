@@ -11,10 +11,21 @@ export interface GitResult {
 	stderr: string;
 }
 
-export async function runGit(args: string[], cwd: string): Promise<GitResult> {
+interface RunGitOptions {
+	allowedExitCodes?: number[];
+}
+
+export async function runGit(args: string[], cwd: string, options?: RunGitOptions): Promise<GitResult> {
+	const allowedExitCodes = options?.allowedExitCodes ?? [0];
 	return await new Promise<GitResult>((resolve, reject) => {
 		execFile('git', args, { cwd }, (error, stdout, stderr) => {
 			if (error) {
+				const exitCode = typeof (error as { code?: unknown }).code === 'number' ? (error as { code: number }).code : undefined;
+				if (exitCode !== undefined && allowedExitCodes.includes(exitCode)) {
+					resolve({ stdout, stderr });
+					return;
+				}
+
 				const message = stderr.trim() || stdout.trim() || error.message;
 				reject(new Error(message));
 				return;

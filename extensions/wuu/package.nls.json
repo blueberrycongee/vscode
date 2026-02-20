@@ -14,5 +14,8 @@
   "command.stopSession": "Stop Session",
   "command.openSessionTerminal": "Open Session Terminal",
   "command.removeSession": "Remove Session",
+  "command.exportTaskPatch": "Export Task Patch",
+  "command.previewPatch": "Preview Patch",
+  "command.applyPatch": "Apply Patch to Workspace",
   "config.worktreesRoot": "Root directory for created worktrees. Supports `${workspaceFolder}` and `${repoRoot}` variables."
 }
