@@ -76,6 +76,11 @@ class WuuTaskItem extends TreeItem {
 		this.description = l10n.t('{0} · {1} files · {2} sessions', state.task.branch, state.changedFiles, sessionCount);
 		this.tooltip = toTaskTooltip(state, sessionCount);
 		this.resourceUri = Uri.file(state.task.worktreePath);
+		this.command = {
+			command: 'wuu.openTask',
+			title: l10n.t('Open Worktree'),
+			arguments: [this],
+		};
 
 		if (state.health === 'error') {
 			this.iconPath = new ThemeIcon('error');
