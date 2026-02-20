@@ -1,0 +1,125 @@
+{
+  "name": "wuu",
+  "publisher": "vscode",
+  "displayName": "%displayName%",
+  "description": "%description%",
+  "version": "10.0.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.5.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": false,
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "activationEvents": [
+    "onView:wuu.tasks",
+    "onCommand:wuu.createTask",
+    "onCommand:wuu.refreshTasks",
+    "onCommand:wuu.openTask",
+    "onCommand:wuu.removeTask"
+  ],
+  "main": "./out/extension",
+  "scripts": {
+    "compile": "gulp compile-extension:wuu",
+    "watch": "gulp watch-extension:wuu"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "wuu",
+          "title": "%viewContainer.wuu.title%",
+          "icon": "media/wuu.svg"
+        }
+      ]
+    },
+    "views": {
+      "wuu": [
+        {
+          "id": "wuu.tasks",
+          "name": "%view.tasks.name%"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "wuu.tasks",
+        "contents": "%view.tasks.welcome%"
+      }
+    ],
+    "commands": [
+      {
+        "command": "wuu.createTask",
+        "category": "%command.category%",
+        "title": "%command.createTask%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "wuu.refreshTasks",
+        "category": "%command.category%",
+        "title": "%command.refreshTasks%",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "wuu.openTask",
+        "category": "%command.category%",
+        "title": "%command.openTask%"
+      },
+      {
+        "command": "wuu.removeTask",
+        "category": "%command.category%",
+        "title": "%command.removeTask%"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "wuu.createTask",
+          "when": "view == wuu.tasks",
+          "group": "navigation"
+        },
+        {
+          "command": "wuu.refreshTasks",
+          "when": "view == wuu.tasks",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "wuu.openTask",
+          "when": "view == wuu.tasks && viewItem == wuuTask",
+          "group": "navigation"
+        },
+        {
+          "command": "wuu.removeTask",
+          "when": "view == wuu.tasks && viewItem == wuuTask",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Wuu",
+      "properties": {
+        "wuu.worktreesRoot": {
+          "type": "string",
+          "scope": "resource",
+          "default": "${workspaceFolder}/.wuu/worktrees",
+          "markdownDescription": "%config.worktreesRoot%"
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "22.x"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/microsoft/vscode.git"
+  }
+}
