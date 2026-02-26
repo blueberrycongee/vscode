@@ -34,7 +34,10 @@
     "onCommand:wuu.requeuePatch",
     "onCommand:wuu.markPatchApplied",
     "onCommand:wuu.removePatch",
-    "onCommand:wuu.focusPatchInbox"
+    "onCommand:wuu.focusPatchInbox",
+    "onCommand:wuu.openSessionTerminalEditor",
+    "onCommand:wuu.quickReplySession",
+    "onCommand:wuu.openDashboard"
   ],
   "main": "./out/extension",
   "scripts": {
@@ -43,7 +46,7 @@
   },
   "contributes": {
     "viewsContainers": {
-      "activitybar": [
+      "panel": [
         {
           "id": "wuu",
           "title": "%viewContainer.wuu.title%",
@@ -120,6 +123,16 @@
         "title": "%command.openSessionTerminal%"
       },
       {
+        "command": "wuu.openSessionTerminalEditor",
+        "category": "%command.category%",
+        "title": "%command.openSessionTerminalEditor%"
+      },
+      {
+        "command": "wuu.quickReplySession",
+        "category": "%command.category%",
+        "title": "%command.quickReplySession%"
+      },
+      {
         "command": "wuu.removeSession",
         "category": "%command.category%",
         "title": "%command.removeSession%"
@@ -158,6 +171,11 @@
         "command": "wuu.focusPatchInbox",
         "category": "%command.category%",
         "title": "%command.focusPatchInbox%"
+      },
+      {
+        "command": "wuu.openDashboard",
+        "category": "%command.category%",
+        "title": "%command.openDashboard%"
       }
     ],
     "menus": {
@@ -191,6 +209,11 @@
           "command": "wuu.refreshTasks",
           "when": "view == wuu.patches",
           "group": "navigation"
+        },
+        {
+          "command": "wuu.openDashboard",
+          "when": "view == wuu.tasks || view == wuu.patches",
+          "group": "navigation@9"
         }
       ],
       "view/item/context": [
@@ -225,8 +248,13 @@
           "group": "navigation@4"
         },
         {
-          "command": "wuu.openSessionTerminal",
+          "command": "wuu.openSessionTerminalEditor",
           "when": "view == wuu.tasks && viewItem == wuuSessionRunning",
+          "group": "navigation"
+        },
+        {
+          "command": "wuu.openSessionTerminalEditor",
+          "when": "view == wuu.tasks && (viewItem == wuuSessionIdle || viewItem == wuuSessionRetry)",
           "group": "navigation"
         },
         {
@@ -243,6 +271,11 @@
           "command": "wuu.startSession",
           "when": "view == wuu.tasks && viewItem == wuuSessionRetry",
           "group": "inline"
+        },
+        {
+          "command": "wuu.quickReplySession",
+          "when": "view == wuu.tasks && (viewItem == wuuSessionRunning || viewItem == wuuSessionIdle || viewItem == wuuSessionRetry)",
+          "group": "navigation@8"
         },
         {
           "command": "wuu.removeSession",

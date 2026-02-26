@@ -4,10 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import {
+	commands,
 	Disposable,
 	Event,
 	EventEmitter,
 	Terminal,
+	ViewColumn,
 	window,
 } from 'vscode';
 
@@ -70,13 +72,17 @@ export class WuuPtyManager implements Disposable {
 	start(sessionId: string, title: string, commandLine: string, cwd: string): WuuPtyInfo {
 		const existing = this.sessions.get(sessionId);
 		if (existing) {
-			existing.terminal.show(true);
+			void this.revealInEditorSide(sessionId);
 			return existing.info;
 		}
 
 		const terminal = window.createTerminal({
 			name: title,
 			cwd,
+			location: {
+				viewColumn: ViewColumn.Beside,
+				preserveFocus: true,
+			},
 		});
 
 		const info: WuuPtyInfo = {
@@ -102,6 +108,16 @@ export class WuuPtyManager implements Disposable {
 		return info;
 	}
 
+	sendText(sessionId: string, text: string, shouldExecute: boolean): boolean {
+		const active = this.sessions.get(sessionId);
+		if (!active) {
+			return false;
+		}
+
+		active.terminal.sendText(text, shouldExecute);
+		return true;
+	}
+
 	stop(sessionId: string): boolean {
 		const active = this.sessions.get(sessionId);
 		if (!active) {
@@ -119,6 +135,17 @@ export class WuuPtyManager implements Disposable {
 		}
 
 		active.terminal.show(true);
+		return true;
+	}
+
+	async revealInEditorSide(sessionId: string): Promise<boolean> {
+		const active = this.sessions.get(sessionId);
+		if (!active) {
+			return false;
+		}
+
+		active.terminal.show(false);
+		await commands.executeCommand('workbench.action.terminal.moveToEditor');
 		return true;
 	}
 }
